@@ -19,47 +19,169 @@ const FALLBACK_CONFIG = {
   GEMINI_FREE_KEY: 'ENTER_KEY_HERE',
 };
 
-// ── Port listener (popup → background) ──────────────────────────────────────
+// ── Session State & Active Port Tracking ─────────────────────────────────────
+
+const POPUP_STATE_KEY = 'POPUP_STATE';
 
 /** Tracks the active AbortController so ABORT_STREAM can cancel it. */
 let activeAbortController = null;
+/** Tracks whether a relay stream is currently in progress. */
+let isStreamActive = false;
+/** Active port currently connected to the popup (null when popup is closed). */
+let currentRelayPort = null;
+
+/**
+ * Safely broadcast a message to the active popup port, if connected.
+ * @param {object} msg
+ */
+function broadcastToPopup(msg) {
+  if (currentRelayPort) {
+    try {
+      currentRelayPort.postMessage(msg);
+    } catch {
+      currentRelayPort = null;
+    }
+  }
+}
+
+/**
+ * If the popup is closed during streaming, append incoming chunks directly to POPUP_STATE in chrome.storage.session.
+ * @param {string} text
+ */
+async function syncChunkToSession(text) {
+  if (!currentRelayPort) {
+    try {
+      const { [POPUP_STATE_KEY]: state } = await chrome.storage.session.get(POPUP_STATE_KEY);
+      if (state) {
+        state.responseText = (state.responseText || '') + text;
+        state.isStreaming = true;
+        await chrome.storage.session.set({ [POPUP_STATE_KEY]: state });
+      }
+    } catch (err) {
+      console.warn('[Synapse] Failed to sync chunk to session storage:', err);
+    }
+  }
+}
+
+/**
+ * Update the stream lifecycle status in POPUP_STATE in chrome.storage.session.
+ * @param {boolean} isStreaming
+ * @param {string} [statusMessage]
+ * @param {string} [statusType]
+ */
+async function updateSessionStreamStatus(isStreaming, statusMessage = '', statusType = '') {
+  try {
+    const { [POPUP_STATE_KEY]: state } = await chrome.storage.session.get(POPUP_STATE_KEY);
+    if (state) {
+      state.isStreaming = isStreaming;
+      if (statusMessage) state.statusMessage = statusMessage;
+      if (statusType) state.statusType = statusType;
+      await chrome.storage.session.set({ [POPUP_STATE_KEY]: state });
+    }
+  } catch (err) {
+    console.warn('[Synapse] Failed to update session stream status:', err);
+  }
+}
+
+// ── Port listener (popup → background) ──────────────────────────────────────
 
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== 'relay-port') return;
 
+  currentRelayPort = port;
+
+  port.onDisconnect.addListener(() => {
+    if (currentRelayPort === port) {
+      currentRelayPort = null;
+    }
+  });
+
   port.onMessage.addListener(async (msg) => {
+    // ── Reconnect signal from a reopened popup ─────────────────────────────
+    if (msg.type === 'RECONNECT') {
+      port.postMessage({
+        type: 'STREAM_STATE',
+        isStreaming: isStreamActive,
+      });
+      return;
+    }
+
     // ── Abort signal ───────────────────────────────────────────────────────
     if (msg.type === 'ABORT_STREAM') {
       if (activeAbortController) {
         activeAbortController.abort();
         activeAbortController = null;
       }
+      isStreamActive = false;
+      await updateSessionStreamStatus(false, '⏹ Stream stopped', 'warning');
       return;
     }
 
     if (msg.type !== 'RELAY_CONTEXT') return;
 
+    if (isStreamActive) {
+      port.postMessage({ type: 'status', message: 'Stream already in progress.' });
+      return;
+    }
+
     const { model, customModel, tabId } = msg;
+    isStreamActive = true;
 
     // ── MV3 Keep-alive: ping every 20 s while streaming ───────────────────
     const keepAliveInterval = setInterval(() => {
-      try { port.postMessage({ type: 'ping' }); } catch { /* port closed */ }
+      broadcastToPopup({ type: 'ping' });
     }, 20_000);
+
+    // Port dispatcher passed to relayContext & stream processing
+    const dispatcher = {
+      postMessage(payload) {
+        broadcastToPopup(payload);
+        if (payload.type === 'CHUNK') {
+          syncChunkToSession(payload.text);
+        } else if (!currentRelayPort) {
+          if (payload.type === 'status') {
+            updateSessionStreamStatus(true, payload.message, 'warning');
+          } else if (payload.type === 'badge') {
+            chrome.storage.session.get(POPUP_STATE_KEY).then(({ [POPUP_STATE_KEY]: state }) => {
+              if (state) {
+                state.modelBadge = `✓ Fulfilled by: ${payload.badge}`;
+                state.modelBadgeVisible = true;
+                chrome.storage.session.set({ [POPUP_STATE_KEY]: state });
+              }
+            }).catch(() => {});
+          }
+        }
+      },
+    };
 
     try {
       // 1. Extract context from the active tab via the content script
       const messages = await extractContext(tabId);
 
+      const extractedText = messages.map((m) => `${m.role}: ${m.text}`).join('\n\n');
+      const tokenCount = estimateTokens(extractedText);
+      const recommended = recommendModel(messages);
+
+      dispatcher.postMessage({
+        type: 'CONTEXT_EXTRACTED',
+        text: extractedText,
+        tokens: tokenCount,
+        recommendation: recommended,
+      });
+
       // 2. Relay through the selected model adapter (with fallback cascade)
-      await relayContext(port, messages, model, customModel);
+      await relayContext(dispatcher, messages, model, customModel);
 
       // 3. Signal completion
-      port.postMessage({ type: 'DONE' });
+      dispatcher.postMessage({ type: 'DONE' });
+      await updateSessionStreamStatus(false, '✓ Stream complete', 'success');
     } catch (err) {
       console.error('[Synapse] Relay pipeline failed:', err);
-      port.postMessage({ type: 'ERROR', message: err.message ?? String(err) });
+      dispatcher.postMessage({ type: 'ERROR', message: err.message ?? String(err) });
+      await updateSessionStreamStatus(false, `✗ ${err.message ?? String(err)}`, 'error');
     } finally {
       clearInterval(keepAliveInterval);
+      isStreamActive = false;
       activeAbortController = null;
     }
   });

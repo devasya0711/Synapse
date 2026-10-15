@@ -17,7 +17,36 @@ const STORAGE_KEYS = {
 const SESSION_KEYS = {
   UNLOCKED:    'synapse_unlocked',
   SESSION_PIN: '_sessionPin',
+  POPUP_STATE: 'POPUP_STATE',
 };
+
+// ── Ephemeral UI State (Synced to chrome.storage.session) ─────────────────────
+let currentPopupState = {
+  model: '',
+  customModel: '',
+  extractedContext: '',
+  tokens: 0,
+  recommendedModel: '—',
+  modelBadge: '',
+  modelBadgeVisible: false,
+  responseText: '',
+  isStreaming: false,
+  statusMessage: '',
+  statusType: '',
+};
+
+/**
+ * Persist partial UI state to chrome.storage.session under POPUP_STATE.
+ * @param {object} partial
+ */
+async function updatePopupState(partial) {
+  Object.assign(currentPopupState, partial);
+  try {
+    await chrome.storage.session.set({ [SESSION_KEYS.POPUP_STATE]: currentPopupState });
+  } catch (err) {
+    console.warn('[Synapse] Failed to sync POPUP_STATE to session storage:', err);
+  }
+}
 
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 const lockBtn             = document.getElementById('btn-lock');
@@ -377,6 +406,14 @@ modelSelect.addEventListener('change', async () => {
   await chrome.storage.local.set({ [STORAGE_KEYS.LAST_MODEL]: modelSelect.value });
   updateRecommendedBadge(modelSelect.value);
   toggleCustomModelInput(modelSelect.value);
+  await updatePopupState({
+    model: modelSelect.value,
+    recommendedModel: recommendedBadge.textContent,
+  });
+});
+
+customModelInput.addEventListener('input', () => {
+  updatePopupState({ customModel: customModelInput.value });
 });
 
 /**
@@ -436,10 +473,154 @@ function appendChunk(chunk) {
  * Opens a chrome.runtime.Port named 'relay-port', sends the relay trigger,
  * and wires onMessage / onDisconnect to stream chunks into the UI.
  */
+/**
+ * Wire message and disconnect listeners to the relay port.
+ * @param {chrome.runtime.Port} port
+ */
+function setupPortListeners(port) {
+  port.onMessage.addListener((msg) => {
+    switch (msg.type) {
+      case 'STREAM_STATE':
+        if (!msg.isStreaming) {
+          responseContainer.classList.remove('streaming');
+          relayBtn.disabled = false;
+          stopBtn.disabled  = true;
+          relayPort = null;
+          updatePopupState({ isStreaming: false });
+        } else {
+          relayBtn.disabled = true;
+          stopBtn.disabled  = false;
+        }
+        break;
+
+      case 'CHUNK':
+        appendChunk(msg.text);
+        currentPopupState.responseText = (currentPopupState.responseText || '') + msg.text;
+        currentPopupState.isStreaming = true;
+        updatePopupState({
+          responseText: currentPopupState.responseText,
+          isStreaming: true,
+        });
+        break;
+
+      case 'clear':
+        clearResponseContainer();
+        currentPopupState.responseText = '';
+        updatePopupState({ responseText: '' });
+        break;
+
+      case 'status':
+        showStatus(relayStatus, msg.message, 'warning', 6000);
+        if (msg.badge) {
+          modelBadge.textContent = `▶ ${msg.badge}`;
+          modelBadge.hidden = false;
+          updatePopupState({
+            statusMessage: msg.message,
+            statusType: 'warning',
+            modelBadge: `▶ ${msg.badge}`,
+            modelBadgeVisible: true,
+          });
+        } else {
+          updatePopupState({
+            statusMessage: msg.message,
+            statusType: 'warning',
+          });
+        }
+        break;
+
+      case 'badge':
+        modelBadge.textContent = `✓ Fulfilled by: ${msg.badge}`;
+        modelBadge.hidden = false;
+        updatePopupState({
+          modelBadge: `✓ Fulfilled by: ${msg.badge}`,
+          modelBadgeVisible: true,
+        });
+        break;
+
+      case 'ping':
+        break;
+
+      case 'DONE':
+        responseContainer.classList.remove('streaming');
+        showStatus(relayStatus, '✓ Stream complete', 'success');
+        flashCounter();
+        relayBtn.disabled = false;
+        stopBtn.disabled  = true;
+        relayPort = null;
+        updatePopupState({
+          isStreaming: false,
+          statusMessage: '✓ Stream complete',
+          statusType: 'success',
+        });
+        break;
+
+      case 'ERROR':
+        responseContainer.classList.remove('streaming');
+        showStatus(relayStatus, `✗ ${msg.message}`, 'error');
+        relayBtn.disabled = false;
+        stopBtn.disabled  = true;
+        relayPort = null;
+        updatePopupState({
+          isStreaming: false,
+          statusMessage: `✗ ${msg.message}`,
+          statusType: 'error',
+        });
+        break;
+
+      case 'CONTEXT_EXTRACTED':
+        if (recommendedBadge && msg.recommendation) {
+          recommendedBadge.textContent = msg.recommendation;
+        }
+        if (tokenCounter && msg.tokens != null) {
+          tokenCounter.textContent = msg.tokens.toLocaleString();
+          flashCounter();
+        }
+        if (msg.text) {
+          tokenCounter.title = msg.text.slice(0, 500);
+        }
+        updatePopupState({
+          extractedContext: msg.text || currentPopupState.extractedContext,
+          tokens: msg.tokens ?? currentPopupState.tokens,
+          recommendedModel: msg.recommendation || currentPopupState.recommendedModel,
+        });
+        break;
+
+      case 'RECOMMENDATION':
+        if (recommendedBadge && msg.recommendation) {
+          recommendedBadge.textContent = msg.recommendation;
+        }
+        if (tokenCounter && msg.tokens != null) {
+          tokenCounter.textContent = msg.tokens.toLocaleString();
+          flashCounter();
+        }
+        updatePopupState({
+          tokens: msg.tokens ?? currentPopupState.tokens,
+          recommendedModel: msg.recommendation || currentPopupState.recommendedModel,
+        });
+        break;
+
+      default:
+        console.warn('[Synapse] Unknown port message type:', msg.type);
+    }
+  });
+
+  port.onDisconnect.addListener(() => {
+    const err = chrome.runtime.lastError;
+    if (err) {
+      console.warn('[Synapse] Port disconnected with error:', err.message);
+    }
+    relayPort = null;
+  });
+}
+
+/**
+ * Opens a chrome.runtime.Port named 'relay-port', sends the relay trigger,
+ * and wires onMessage / onDisconnect to stream chunks into the UI.
+ */
 async function handleRelay() {
   // Defensive check: Ensure vault is unlocked
-  const session = await chrome.storage.session.get([SESSION_KEYS.UNLOCKED]);
-  if (!session[SESSION_KEYS.UNLOCKED]) {
+  const session = await chrome.storage.session.get([SESSION_KEYS.UNLOCKED, SESSION_KEYS.SESSION_PIN]);
+  if (!session[SESSION_KEYS.UNLOCKED] && !session[SESSION_KEYS.SESSION_PIN]) {
     showStatus(relayStatus, '⚠ Please unlock Synapse first', 'warning');
     showLockScreen(false);
     return;
@@ -471,97 +652,29 @@ async function handleRelay() {
   clearResponseContainer();
   showStatus(relayStatus, 'Connecting…', '');
 
+  currentPopupState.responseText = '';
+  currentPopupState.isStreaming = true;
+  await updatePopupState({
+    responseText: '',
+    isStreaming: true,
+    model,
+    customModel: customModel || '',
+    statusMessage: 'Connecting…',
+    statusType: '',
+  });
+
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab?.id) throw new Error('No active tab found.');
 
     // Open a long-lived connection to the background service worker
     relayPort = chrome.runtime.connect({ name: 'relay-port' });
+    setupPortListeners(relayPort);
 
-    // ── Incoming message handler ────────────────────────────────
-    relayPort.onMessage.addListener((msg) => {
-      switch (msg.type) {
-        case 'CHUNK':
-          appendChunk(msg.text);
-          break;
-
-        case 'clear':
-          // Background signalling a cascade reset — wipe partially rendered tokens
-          responseContainer.textContent = '';
-          responseContainer.hidden = true;
-          responseContainer.classList.remove('streaming');
-          break;
-
-        case 'status':
-          // Cascade status update + optional badge
-          showStatus(relayStatus, msg.message, 'warning', 6000);
-          if (msg.badge) {
-            modelBadge.textContent = `▶ ${msg.badge}`;
-            modelBadge.hidden = false;
-          }
-          break;
-
-        case 'badge':
-          // Model that actually fulfilled the request
-          modelBadge.textContent = `✓ Fulfilled by: ${msg.badge}`;
-          modelBadge.hidden = false;
-          break;
-
-        case 'ping':
-          // Keep-alive from background — no UI action needed
-          break;
-
-        case 'DONE':
-          responseContainer.classList.remove('streaming');
-          showStatus(relayStatus, '✓ Stream complete', 'success');
-          flashCounter();
-          relayBtn.disabled = false;
-          stopBtn.disabled  = true;
-          relayPort = null;
-          break;
-
-        case 'ERROR':
-          responseContainer.classList.remove('streaming');
-          showStatus(relayStatus, `✗ ${msg.message}`, 'error');
-          relayBtn.disabled = false;
-          stopBtn.disabled  = true;
-          relayPort = null;
-          break;
-
-        case 'RECOMMENDATION':
-          if (recommendedBadge && msg.recommendation) {
-            recommendedBadge.textContent = msg.recommendation;
-          }
-          if (tokenCounter && msg.tokens != null) {
-            tokenCounter.textContent = msg.tokens.toLocaleString();
-            flashCounter();
-          }
-          break;
-
-        default:
-          console.warn('[Synapse] Unknown port message type:', msg.type);
-      }
-    });
-
-    // ── Port closed unexpectedly (SW terminated, etc.) ──────────
-    relayPort.onDisconnect.addListener(() => {
-      const err = chrome.runtime.lastError;
-      if (err) {
-        console.error('[Synapse] Port disconnected with error:', err.message);
-        showStatus(relayStatus, `✗ Disconnected: ${err.message}`, 'error');
-      } else if (responseContainer.classList.contains('streaming')) {
-        // Stream was cut short without a DONE message
-        responseContainer.classList.remove('streaming');
-        showStatus(relayStatus, '⚠ Connection closed before stream finished', 'warning');
-      }
-      relayBtn.disabled = false;
-      stopBtn.disabled  = true;
-      relayPort = null;
-    });
-
-    // ── Send the relay trigger through the port ─────────────────
+    // Send the relay trigger through the port
     relayPort.postMessage({ type: 'RELAY_CONTEXT', model, customModel: customModel || undefined, tabId: tab.id });
     showStatus(relayStatus, 'Streaming…', '');
+    updatePopupState({ statusMessage: 'Streaming…', statusType: '' });
 
   } catch (err) {
     console.error('[Synapse] Relay error:', err);
@@ -569,6 +682,7 @@ async function handleRelay() {
     relayBtn.disabled = false;
     stopBtn.disabled  = true;
     relayPort = null;
+    updatePopupState({ isStreaming: false, statusMessage: `✗ ${err.message}`, statusType: 'error' });
   }
 }
 
@@ -584,6 +698,11 @@ stopBtn.addEventListener('click', () => {
   responseContainer.classList.remove('streaming');
   showStatus(relayStatus, '⏹ Stream stopped', 'warning');
   relayPort = null;
+  updatePopupState({
+    isStreaming: false,
+    statusMessage: '⏹ Stream stopped',
+    statusType: 'warning',
+  });
 });
 
 // ── Lock Screen UI & Event Wiring ──────────────────────────────────────────
@@ -762,7 +881,25 @@ pinForm.addEventListener('submit', handlePinSubmit);
 // Lock button: wipe session and show lock screen
 if (lockBtn) {
   lockBtn.addEventListener('click', async () => {
+    if (relayPort) {
+      try { relayPort.postMessage({ type: 'ABORT_STREAM' }); } catch {}
+      relayPort = null;
+    }
     await chrome.storage.session.clear();
+    currentPopupState = {
+      model: '',
+      customModel: '',
+      extractedContext: '',
+      tokens: 0,
+      recommendedModel: '—',
+      modelBadge: '',
+      modelBadgeVisible: false,
+      responseText: '',
+      isStreaming: false,
+      statusMessage: '',
+      statusType: '',
+    };
+    clearResponseContainer();
     for (const inputEl of Object.values(keyInputs)) {
       inputEl.value = '';
       inputEl.placeholder = inputEl.dataset.defaultPlaceholder || '';
@@ -772,16 +909,23 @@ if (lockBtn) {
   });
 }
 
-// ── Init ─────────────────────────────────────────────────────────────────────
+// ── Init & Session Hydration ─────────────────────────────────────────────────
 
 async function init() {
-  // 1. Check if already unlocked in active Chrome session
-  const session = await chrome.storage.session.get([SESSION_KEYS.UNLOCKED]);
-  if (session[SESSION_KEYS.UNLOCKED]) {
+  // 1. Inspect session storage for active credentials & cached state
+  const session = await chrome.storage.session.get([
+    SESSION_KEYS.UNLOCKED,
+    SESSION_KEYS.SESSION_PIN,
+    SESSION_KEYS.POPUP_STATE,
+  ]);
+
+  const hasActiveSession = Boolean(session[SESSION_KEYS.UNLOCKED] || session[SESSION_KEYS.SESSION_PIN]);
+  if (hasActiveSession) {
+    // Session credentials exist — immediately bypass PIN lock
     hideLockScreen();
     await loadSavedKeys();
   } else {
-    // 2. Check if encrypted vault exists in local storage
+    // Check if encrypted vault exists in local storage
     const local = await chrome.storage.local.get([STORAGE_KEYS.ENCRYPTED_VAULT]);
     if (local[STORAGE_KEYS.ENCRYPTED_VAULT]) {
       showLockScreen(false); // Unlock mode
@@ -790,7 +934,76 @@ async function init() {
     }
   }
 
-  await restoreLastModel();
+  // 2. Hydrate cached UI state
+  const cached = session[SESSION_KEYS.POPUP_STATE];
+  if (cached && typeof cached === 'object') {
+    Object.assign(currentPopupState, cached);
+  }
+
+  // Restore model dropdown & custom model input
+  if (currentPopupState.model) {
+    modelSelect.value = currentPopupState.model;
+  } else {
+    await restoreLastModel();
+  }
+  updateRecommendedBadge(modelSelect.value);
+  toggleCustomModelInput(modelSelect.value);
+
+  if (currentPopupState.customModel) {
+    customModelInput.value = currentPopupState.customModel;
+  }
+
+  // Restore token count, recommendation, and context preview
+  if (currentPopupState.tokens != null && currentPopupState.tokens > 0) {
+    tokenCounter.textContent = currentPopupState.tokens.toLocaleString();
+  }
+  if (currentPopupState.recommendedModel && currentPopupState.recommendedModel !== '—') {
+    recommendedBadge.textContent = currentPopupState.recommendedModel;
+  }
+  if (currentPopupState.extractedContext) {
+    tokenCounter.title = currentPopupState.extractedContext.slice(0, 500);
+  }
+
+  // Restore model fulfillment badge
+  if (currentPopupState.modelBadge) {
+    modelBadge.textContent = currentPopupState.modelBadge;
+    modelBadge.hidden = !currentPopupState.modelBadgeVisible;
+  } else {
+    modelBadge.hidden = true;
+  }
+
+  // Restore response & streaming state
+  if (currentPopupState.isStreaming) {
+    responseContainer.textContent = currentPopupState.responseText || '';
+    responseContainer.hidden = false;
+    responseContainer.classList.add('streaming');
+    relayBtn.disabled = true;
+    stopBtn.disabled  = false;
+    if (currentPopupState.statusMessage) {
+      showStatus(relayStatus, currentPopupState.statusMessage, currentPopupState.statusType || '');
+    }
+
+    // Re-attach to background stream port
+    try {
+      relayPort = chrome.runtime.connect({ name: 'relay-port' });
+      setupPortListeners(relayPort);
+      relayPort.postMessage({ type: 'RECONNECT' });
+    } catch (err) {
+      console.warn('[Synapse] Failed to re-attach to stream port:', err);
+      relayBtn.disabled = false;
+      stopBtn.disabled  = true;
+      updatePopupState({ isStreaming: false });
+    }
+  } else if (currentPopupState.responseText) {
+    responseContainer.textContent = currentPopupState.responseText;
+    responseContainer.hidden = false;
+    responseContainer.classList.remove('streaming');
+    relayBtn.disabled = false;
+    stopBtn.disabled  = true;
+    if (currentPopupState.statusMessage) {
+      showStatus(relayStatus, currentPopupState.statusMessage, currentPopupState.statusType || '');
+    }
+  }
 }
 
 init();
