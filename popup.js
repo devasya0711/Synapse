@@ -6,12 +6,14 @@
 
 // ── Storage key constants ────────────────────────────────────────────────────
 const STORAGE_KEYS = {
-  GEMINI_KEY:      'apiKey_gemini',
-  CLAUDE_KEY:      'apiKey_claude',
-  OPENAI_KEY:      'apiKey_openai',
-  GROQ_KEY:        'apiKey_groq',
-  LAST_MODEL:      'lastSelectedModel',
-  ENCRYPTED_VAULT: 'encrypted_vault',
+  GEMINI_KEY:          'apiKey_gemini',
+  CLAUDE_KEY:          'apiKey_claude',
+  OPENAI_KEY:          'apiKey_openai',
+  GROQ_KEY:            'apiKey_groq',
+  LAST_MODEL:          'lastSelectedModel',
+  ENCRYPTED_VAULT:     'encrypted_vault',
+  FAILED_PIN_ATTEMPTS: 'failedPinAttempts',
+  LOCKOUT_UNTIL:       'lockoutUntil',
 };
 
 const SESSION_KEYS = {
@@ -63,6 +65,8 @@ const pinInputsContainer  = document.getElementById('pin-inputs');
 const lockStatus          = document.getElementById('lock-status');
 const lockSubmitBtn       = document.getElementById('btn-lock-submit');
 
+const restrictedTabBanner = document.getElementById('restricted-tab-banner');
+
 const modelSelect         = document.getElementById('model-select');
 const customModelGroup    = document.getElementById('custom-model-group');
 const customModelInput    = document.getElementById('custom-model-input');
@@ -71,6 +75,168 @@ const stopBtn             = document.getElementById('btn-stop');
 const relayStatus         = document.getElementById('relay-status');
 const responseContainer   = document.getElementById('response-container');
 const modelBadge          = document.getElementById('model-badge');
+
+let isCurrentTabRestricted = false;
+let isRelaying             = false;
+let lockoutTimerId         = null;
+
+// ── Tab Safety & Restricted URL Guard ────────────────────────────────────────
+
+/**
+ * Detect whether a tab URL is restricted from extension script injection or DOM extraction.
+ * @param {string} url
+ * @returns {boolean}
+ */
+export function isRestrictedUrl(url) {
+  if (!url || typeof url !== 'string') return true;
+  const lowercaseUrl = url.toLowerCase().trim();
+  if (
+    lowercaseUrl.startsWith('chrome://') ||
+    lowercaseUrl.startsWith('chrome-extension://') ||
+    lowercaseUrl.startsWith('about:') ||
+    lowercaseUrl.startsWith('edge://')
+  ) {
+    return true;
+  }
+  if (
+    lowercaseUrl.includes('chromewebstore.google.com') ||
+    lowercaseUrl.includes('chrome.google.com/webstore')
+  ) {
+    return true;
+  }
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return true;
+    }
+  } catch {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Inspect active tab URL. Toggles restricted banner and manages relay button disabled state.
+ * @returns {Promise<boolean>}
+ */
+async function checkActiveTabSafety() {
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    const isRestricted = isRestrictedUrl(tab?.url);
+    isCurrentTabRestricted = isRestricted;
+
+    if (restrictedTabBanner) {
+      restrictedTabBanner.hidden = !isRestricted;
+    }
+
+    if (isRestricted) {
+      relayBtn.disabled = true;
+      relayBtn.title = 'Active page is a restricted browser tab. Open a standard webpage to extract context.';
+    } else {
+      relayBtn.title = '';
+      if (!isRelaying && !currentPopupState.isStreaming) {
+        relayBtn.disabled = false;
+      }
+    }
+    return !isRestricted;
+  } catch (err) {
+    console.warn('[Synapse] Active tab check failed:', err);
+    return false;
+  }
+}
+
+/**
+ * Toggle the Relay button between ready and loading spinner states.
+ * @param {boolean} loading
+ */
+function setRelayButtonLoading(loading) {
+  if (loading) {
+    relayBtn.disabled = true;
+    relayBtn.innerHTML = '<span class="btn-spinner" aria-hidden="true"></span> Relaying…';
+  } else {
+    relayBtn.innerHTML = '<span class="btn-icon">⚡</span> Relay Context';
+    if (!isCurrentTabRestricted && !currentPopupState.isStreaming && !isRelaying) {
+      relayBtn.disabled = false;
+    } else {
+      relayBtn.disabled = true;
+    }
+  }
+}
+
+// ── Master PIN Brute-Force Throttling ────────────────────────────────────────
+
+/**
+ * Enable or disable all PIN input boxes and the unlock button.
+ * @param {boolean} disabled
+ */
+function setPinInputsDisabled(disabled) {
+  pinInputs.forEach((input) => {
+    input.disabled = disabled;
+  });
+  lockSubmitBtn.disabled = disabled;
+}
+
+/**
+ * Start or resume the lockout countdown timer.
+ * @param {number} lockoutUntil Timestamp when lockout ends
+ */
+function startLockoutCountdown(lockoutUntil) {
+  if (lockoutTimerId) {
+    clearInterval(lockoutTimerId);
+    lockoutTimerId = null;
+  }
+
+  setPinInputsDisabled(true);
+
+  const tick = () => {
+    const now = Date.now();
+    const remainingMs = lockoutUntil - now;
+    const remainingSec = Math.max(0, Math.ceil(remainingMs / 1000));
+
+    if (remainingSec > 0) {
+      lockStatus.textContent = `Too many failed attempts. Locked for ${remainingSec} seconds.`;
+      lockStatus.className = 'lock-status error';
+    } else {
+      if (lockoutTimerId) {
+        clearInterval(lockoutTimerId);
+        lockoutTimerId = null;
+      }
+      setPinInputsDisabled(false);
+      lockStatus.textContent = '';
+      lockStatus.className = 'lock-status';
+      chrome.storage.local.remove(STORAGE_KEYS.LOCKOUT_UNTIL);
+      pinInputs.forEach((input) => { input.value = ''; });
+      setTimeout(() => pinInputs[0]?.focus(), 50);
+    }
+  };
+
+  tick();
+  lockoutTimerId = setInterval(tick, 1000);
+}
+
+/**
+ * Check if the PIN entry is currently in a lockout state.
+ * @returns {Promise<boolean>}
+ */
+async function checkPinLockout() {
+  const stored = await chrome.storage.local.get([
+    STORAGE_KEYS.FAILED_PIN_ATTEMPTS,
+    STORAGE_KEYS.LOCKOUT_UNTIL,
+  ]);
+  const lockoutUntil = stored[STORAGE_KEYS.LOCKOUT_UNTIL] || 0;
+  const now = Date.now();
+
+  if (lockoutUntil && lockoutUntil > now) {
+    startLockoutCountdown(lockoutUntil);
+    return true;
+  } else if (lockoutUntil && lockoutUntil <= now) {
+    await chrome.storage.local.remove(STORAGE_KEYS.LOCKOUT_UNTIL);
+    setPinInputsDisabled(false);
+    return false;
+  }
+  setPinInputsDisabled(false);
+  return false;
+}
 
 const saveKeysBtn         = document.getElementById('btn-save-keys');
 const saveStatus          = document.getElementById('save-status');
@@ -483,13 +649,15 @@ function setupPortListeners(port) {
       case 'STREAM_STATE':
         if (!msg.isStreaming) {
           responseContainer.classList.remove('streaming');
-          relayBtn.disabled = false;
+          isRelaying = false;
           stopBtn.disabled  = true;
           relayPort = null;
           updatePopupState({ isStreaming: false });
+          setRelayButtonLoading(false);
         } else {
-          relayBtn.disabled = true;
+          isRelaying = true;
           stopBtn.disabled  = false;
+          setRelayButtonLoading(true);
         }
         break;
 
@@ -540,11 +708,24 @@ function setupPortListeners(port) {
       case 'ping':
         break;
 
+      case 'RESTRICTED_TAB':
+        isCurrentTabRestricted = true;
+        if (restrictedTabBanner) {
+          restrictedTabBanner.hidden = false;
+        }
+        isRelaying = false;
+        stopBtn.disabled = true;
+        relayPort = null;
+        setRelayButtonLoading(false);
+        showStatus(relayStatus, 'Active page is a restricted browser tab. Open a standard webpage to extract context.', 'warning');
+        updatePopupState({ isStreaming: false });
+        break;
+
       case 'DONE':
         responseContainer.classList.remove('streaming');
         showStatus(relayStatus, '✓ Stream complete', 'success');
         flashCounter();
-        relayBtn.disabled = false;
+        isRelaying = false;
         stopBtn.disabled  = true;
         relayPort = null;
         updatePopupState({
@@ -552,12 +733,13 @@ function setupPortListeners(port) {
           statusMessage: '✓ Stream complete',
           statusType: 'success',
         });
+        setRelayButtonLoading(false);
         break;
 
       case 'ERROR':
         responseContainer.classList.remove('streaming');
         showStatus(relayStatus, `✗ ${msg.message}`, 'error');
-        relayBtn.disabled = false;
+        isRelaying = false;
         stopBtn.disabled  = true;
         relayPort = null;
         updatePopupState({
@@ -565,6 +747,7 @@ function setupPortListeners(port) {
           statusMessage: `✗ ${msg.message}`,
           statusType: 'error',
         });
+        setRelayButtonLoading(false);
         break;
 
       case 'CONTEXT_EXTRACTED':
@@ -610,6 +793,9 @@ function setupPortListeners(port) {
       console.warn('[Synapse] Port disconnected with error:', err.message);
     }
     relayPort = null;
+    isRelaying = false;
+    stopBtn.disabled = true;
+    setRelayButtonLoading(false);
   });
 }
 
@@ -618,9 +804,27 @@ function setupPortListeners(port) {
  * and wires onMessage / onDisconnect to stream chunks into the UI.
  */
 async function handleRelay() {
+  // Double-Click Guard: Prevent duplicate triggers if already initiating or streaming
+  if (isRelaying || relayBtn.disabled || currentPopupState.isStreaming || Boolean(relayPort)) {
+    return;
+  }
+  isRelaying = true;
+  setRelayButtonLoading(true);
+
+  // Restricted URL & Tab Guard: Check active tab before proceeding
+  const isSafe = await checkActiveTabSafety();
+  if (!isSafe) {
+    isRelaying = false;
+    setRelayButtonLoading(false);
+    showStatus(relayStatus, 'Active page is a restricted browser tab. Open a standard webpage to extract context.', 'warning');
+    return;
+  }
+
   // Defensive check: Ensure vault is unlocked
   const session = await chrome.storage.session.get([SESSION_KEYS.UNLOCKED, SESSION_KEYS.SESSION_PIN]);
   if (!session[SESSION_KEYS.UNLOCKED] && !session[SESSION_KEYS.SESSION_PIN]) {
+    isRelaying = false;
+    setRelayButtonLoading(false);
     showStatus(relayStatus, '⚠ Please unlock Synapse first', 'warning');
     showLockScreen(false);
     return;
@@ -628,6 +832,8 @@ async function handleRelay() {
 
   const model = modelSelect.value;
   if (!model) {
+    isRelaying = false;
+    setRelayButtonLoading(false);
     showStatus(relayStatus, '⚠ Please select a model first', 'warning');
     return;
   }
@@ -636,18 +842,13 @@ async function handleRelay() {
   const isCustom    = model.startsWith('__custom_');
   const customModel = customModelInput.value.trim();
   if (isCustom && !customModel) {
+    isRelaying = false;
+    setRelayButtonLoading(false);
     showStatus(relayStatus, '⚠ Please enter a custom model ID', 'warning');
     customModelInput.focus();
     return;
   }
 
-  // Prevent concurrent relay sessions
-  if (relayPort) {
-    showStatus(relayStatus, '⚠ A relay is already in progress', 'warning');
-    return;
-  }
-
-  relayBtn.disabled = true;
   stopBtn.disabled  = false;
   clearResponseContainer();
   showStatus(relayStatus, 'Connecting…', '');
@@ -667,6 +868,10 @@ async function handleRelay() {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab?.id) throw new Error('No active tab found.');
 
+    if (isRestrictedUrl(tab.url)) {
+      throw new Error('Active page is a restricted browser tab. Open a standard webpage to extract context.');
+    }
+
     // Open a long-lived connection to the background service worker
     relayPort = chrome.runtime.connect({ name: 'relay-port' });
     setupPortListeners(relayPort);
@@ -679,7 +884,8 @@ async function handleRelay() {
   } catch (err) {
     console.error('[Synapse] Relay error:', err);
     showStatus(relayStatus, `✗ ${err.message}`, 'error');
-    relayBtn.disabled = false;
+    isRelaying = false;
+    setRelayButtonLoading(false);
     stopBtn.disabled  = true;
     relayPort = null;
     updatePopupState({ isStreaming: false, statusMessage: `✗ ${err.message}`, statusType: 'error' });
@@ -693,7 +899,8 @@ stopBtn.addEventListener('click', () => {
   if (relayPort) {
     try { relayPort.postMessage({ type: 'ABORT_STREAM' }); } catch { /* port closed */ }
   }
-  relayBtn.disabled = false;
+  isRelaying = false;
+  setRelayButtonLoading(false);
   stopBtn.disabled  = true;
   responseContainer.classList.remove('streaming');
   showStatus(relayStatus, '⏹ Stream stopped', 'warning');
@@ -704,6 +911,17 @@ stopBtn.addEventListener('click', () => {
     statusType: 'warning',
   });
 });
+
+// Block duplicate keyboard shortcut triggers (Enter) while generation is active
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    const isGenerating = isRelaying || currentPopupState.isStreaming || Boolean(relayPort);
+    if (isGenerating) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  }
+}, true);
 
 // ── Lock Screen UI & Event Wiring ──────────────────────────────────────────
 
@@ -723,11 +941,17 @@ function showLockScreen(setupMode = false) {
     lockSubtitle.textContent = 'Create a 4-digit PIN to encrypt your API keys';
     lockSubmitBtn.textContent = 'Set PIN';
     lockScreen.dataset.mode = 'setup';
+    if (lockoutTimerId) {
+      clearInterval(lockoutTimerId);
+      lockoutTimerId = null;
+    }
+    setPinInputsDisabled(false);
   } else {
     lockTitle.textContent = 'Unlock Synapse';
     lockSubtitle.textContent = 'Enter your 4-digit Master PIN';
     lockSubmitBtn.textContent = 'Unlock';
     lockScreen.dataset.mode = 'unlock';
+    checkPinLockout();
   }
 
   setTimeout(() => pinInputs[0]?.focus(), 50);
@@ -749,6 +973,21 @@ function hideLockScreen() {
 async function handlePinSubmit(e) {
   if (e) e.preventDefault();
 
+  const isSetup = lockScreen.dataset.mode === 'setup';
+
+  // Master PIN Brute-Force Check: Block entry if locked out
+  if (!isSetup) {
+    const storedLockout = await chrome.storage.local.get([
+      STORAGE_KEYS.FAILED_PIN_ATTEMPTS,
+      STORAGE_KEYS.LOCKOUT_UNTIL,
+    ]);
+    const lockoutUntil = storedLockout[STORAGE_KEYS.LOCKOUT_UNTIL] || 0;
+    if (lockoutUntil && lockoutUntil > Date.now()) {
+      startLockoutCountdown(lockoutUntil);
+      return;
+    }
+  }
+
   const pin = Array.from(pinInputs).map((input) => input.value).join('');
   if (pin.length !== 4) {
     lockStatus.textContent = 'Please enter all 4 digits.';
@@ -758,7 +997,6 @@ async function handlePinSubmit(e) {
     return;
   }
 
-  const isSetup = lockScreen.dataset.mode === 'setup';
   lockSubmitBtn.disabled = true;
   lockStatus.textContent = isSetup ? 'Deriving key & setting PIN…' : 'Deriving key & verifying PIN…';
   lockStatus.className = 'lock-status';
@@ -796,6 +1034,15 @@ async function handlePinSubmit(e) {
         STORAGE_KEYS.GROQ_KEY,
       ]);
 
+      // Reset failedPinAttempts to 0 upon successful PIN entry
+      await chrome.storage.local.set({ [STORAGE_KEYS.FAILED_PIN_ATTEMPTS]: 0 });
+      await chrome.storage.local.remove(STORAGE_KEYS.LOCKOUT_UNTIL);
+      if (lockoutTimerId) {
+        clearInterval(lockoutTimerId);
+        lockoutTimerId = null;
+      }
+      setPinInputsDisabled(false);
+
       hideLockScreen();
       await loadSavedKeys();
       showStatus(relayStatus, '✓ Master PIN set & vault unlocked', 'success');
@@ -819,26 +1066,64 @@ async function handlePinSubmit(e) {
       }
 
       await chrome.storage.session.set(sessionPayload);
+
+      // Reset failedPinAttempts to 0 upon a successful PIN entry
+      await chrome.storage.local.set({ [STORAGE_KEYS.FAILED_PIN_ATTEMPTS]: 0 });
+      await chrome.storage.local.remove(STORAGE_KEYS.LOCKOUT_UNTIL);
+      if (lockoutTimerId) {
+        clearInterval(lockoutTimerId);
+        lockoutTimerId = null;
+      }
+      setPinInputsDisabled(false);
+
       hideLockScreen();
       await loadSavedKeys();
       showStatus(relayStatus, '✓ Synapse unlocked', 'success');
     }
   } catch (err) {
     console.warn('[Synapse] PIN verification failed:', err);
-    lockStatus.textContent = isSetup ? 'Failed to set PIN.' : 'Incorrect PIN. Please try again.';
-    lockStatus.className = 'lock-status error';
+
+    if (!isSetup) {
+      const stored = await chrome.storage.local.get([
+        STORAGE_KEYS.FAILED_PIN_ATTEMPTS,
+        STORAGE_KEYS.LOCKOUT_UNTIL,
+      ]);
+      const attempts = (Number(stored[STORAGE_KEYS.FAILED_PIN_ATTEMPTS]) || 0) + 1;
+
+      if (attempts >= 5) {
+        const lockoutDurationMs = 30_000;
+        const newLockoutUntil = Date.now() + lockoutDurationMs;
+        await chrome.storage.local.set({
+          [STORAGE_KEYS.FAILED_PIN_ATTEMPTS]: attempts,
+          [STORAGE_KEYS.LOCKOUT_UNTIL]: newLockoutUntil,
+        });
+        startLockoutCountdown(newLockoutUntil);
+        return;
+      } else {
+        await chrome.storage.local.set({ [STORAGE_KEYS.FAILED_PIN_ATTEMPTS]: attempts });
+        lockStatus.textContent = 'Incorrect PIN. Please try again.';
+        lockStatus.className = 'lock-status error';
+      }
+    } else {
+      lockStatus.textContent = 'Failed to set PIN.';
+      lockStatus.className = 'lock-status error';
+    }
+
     pinInputsContainer.classList.add('shake');
     setTimeout(() => pinInputsContainer.classList.remove('shake'), 400);
     pinInputs.forEach((input) => { input.value = ''; });
     pinInputs[0]?.focus();
   } finally {
-    lockSubmitBtn.disabled = false;
+    if (!lockoutTimerId) {
+      lockSubmitBtn.disabled = false;
+    }
   }
 }
 
 // PIN inputs navigation (auto-advance, backspace, paste)
 pinInputs.forEach((input, index) => {
   input.addEventListener('input', (e) => {
+    if (input.disabled) return;
     const val = e.target.value.replace(/[^0-9]/g, '');
     e.target.value = val ? val[val.length - 1] : '';
 
@@ -852,12 +1137,14 @@ pinInputs.forEach((input, index) => {
   });
 
   input.addEventListener('keydown', (e) => {
+    if (input.disabled) return;
     if (e.key === 'Backspace' && !input.value && index > 0) {
       pinInputs[index - 1].focus();
     }
   });
 
   input.addEventListener('paste', (e) => {
+    if (input.disabled) return;
     e.preventDefault();
     const pasteData = (e.clipboardData || window.clipboardData).getData('text').trim();
     const digits = pasteData.replace(/[^0-9]/g, '').slice(0, 4);
@@ -912,6 +1199,26 @@ if (lockBtn) {
 // ── Init & Session Hydration ─────────────────────────────────────────────────
 
 async function init() {
+  // Master PIN brute-force lockout check
+  await checkPinLockout();
+
+  // Active tab safety check and event wiring
+  await checkActiveTabSafety();
+
+  if (chrome.tabs?.onActivated) {
+    chrome.tabs.onActivated.addListener(() => {
+      checkActiveTabSafety();
+    });
+  }
+
+  if (chrome.tabs?.onUpdated) {
+    chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+      if (tab?.active) {
+        checkActiveTabSafety();
+      }
+    });
+  }
+
   // 1. Inspect session storage for active credentials & cached state
   const session = await chrome.storage.session.get([
     SESSION_KEYS.UNLOCKED,
@@ -990,7 +1297,7 @@ async function init() {
       relayPort.postMessage({ type: 'RECONNECT' });
     } catch (err) {
       console.warn('[Synapse] Failed to re-attach to stream port:', err);
-      relayBtn.disabled = false;
+      relayBtn.disabled = isCurrentTabRestricted;
       stopBtn.disabled  = true;
       updatePopupState({ isStreaming: false });
     }
@@ -998,7 +1305,7 @@ async function init() {
     responseContainer.textContent = currentPopupState.responseText;
     responseContainer.hidden = false;
     responseContainer.classList.remove('streaming');
-    relayBtn.disabled = false;
+    relayBtn.disabled = isCurrentTabRestricted;
     stopBtn.disabled  = true;
     if (currentPopupState.statusMessage) {
       showStatus(relayStatus, currentPopupState.statusMessage, currentPopupState.statusType || '');

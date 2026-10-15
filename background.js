@@ -117,6 +117,39 @@ chrome.runtime.onConnect.addListener((port) => {
       return;
     }
 
+/**
+ * Detect whether a tab URL is restricted from extension script injection or DOM extraction.
+ * @param {string} url
+ * @returns {boolean}
+ */
+export function isRestrictedUrl(url) {
+  if (!url || typeof url !== 'string') return true;
+  const lowercaseUrl = url.toLowerCase().trim();
+  if (
+    lowercaseUrl.startsWith('chrome://') ||
+    lowercaseUrl.startsWith('chrome-extension://') ||
+    lowercaseUrl.startsWith('about:') ||
+    lowercaseUrl.startsWith('edge://')
+  ) {
+    return true;
+  }
+  if (
+    lowercaseUrl.includes('chromewebstore.google.com') ||
+    lowercaseUrl.includes('chrome.google.com/webstore')
+  ) {
+    return true;
+  }
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return true;
+    }
+  } catch {
+    return true;
+  }
+  return false;
+}
+
     if (msg.type !== 'RELAY_CONTEXT') return;
 
     if (isStreamActive) {
@@ -125,6 +158,27 @@ chrome.runtime.onConnect.addListener((port) => {
     }
 
     const { model, customModel, tabId } = msg;
+
+    // Restricted URL & Tab Guard: Query active tab's URL before attempting context extraction
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab || isRestrictedUrl(tab.url)) {
+      console.warn(`[Synapse] Suppressed DOM extraction on restricted tab: ${tab?.url}`);
+      port.postMessage({
+        type: 'RESTRICTED_TAB',
+        message: 'Active page is a restricted browser tab. Open a standard webpage to extract context.',
+      });
+      port.postMessage({
+        type: 'ERROR',
+        message: 'Active page is a restricted browser tab. Open a standard webpage to extract context.',
+      });
+      await updateSessionStreamStatus(
+        false,
+        'Active page is a restricted browser tab. Open a standard webpage to extract context.',
+        'warning'
+      );
+      return;
+    }
+
     isStreamActive = true;
 
     // ── MV3 Keep-alive: ping every 20 s while streaming ───────────────────
@@ -198,13 +252,21 @@ chrome.runtime.onConnect.addListener((port) => {
  */
 function extractContext(tabId) {
   return new Promise((resolve, reject) => {
-    // Ensure the content script is injected first
-    chrome.scripting.executeScript(
-      { target: { tabId }, files: ['content.js'] },
-      () => {
-        if (chrome.runtime.lastError) {
-          return reject(new Error(chrome.runtime.lastError.message));
-        }
+    chrome.tabs.get(tabId, (tab) => {
+      if (chrome.runtime.lastError || !tab) {
+        return reject(new Error(chrome.runtime.lastError?.message || 'Tab not found.'));
+      }
+      if (isRestrictedUrl(tab.url)) {
+        return reject(new Error('Active page is a restricted browser tab. Open a standard webpage to extract context.'));
+      }
+
+      // Ensure the content script is injected first
+      chrome.scripting.executeScript(
+        { target: { tabId }, files: ['content.js'] },
+        () => {
+          if (chrome.runtime.lastError) {
+            return reject(new Error(chrome.runtime.lastError.message));
+          }
 
         const contentPort = chrome.tabs.connect(tabId, { name: 'content-extractor' });
 
@@ -226,6 +288,7 @@ function extractContext(tabId) {
         contentPort.postMessage({ type: 'EXTRACT_CONTEXT' });
       }
     );
+    });
   });
 }
 
