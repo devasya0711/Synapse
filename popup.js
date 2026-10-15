@@ -6,17 +6,33 @@
 
 // ── Storage key constants ────────────────────────────────────────────────────
 const STORAGE_KEYS = {
-  GEMINI_KEY: 'apiKey_gemini',
-  CLAUDE_KEY:  'apiKey_claude',
-  OPENAI_KEY:  'apiKey_openai',
-  GROQ_KEY:    'apiKey_groq',
-  LAST_MODEL:  'lastSelectedModel',
+  GEMINI_KEY:      'apiKey_gemini',
+  CLAUDE_KEY:      'apiKey_claude',
+  OPENAI_KEY:      'apiKey_openai',
+  GROQ_KEY:        'apiKey_groq',
+  LAST_MODEL:      'lastSelectedModel',
+  ENCRYPTED_VAULT: 'encrypted_vault',
+};
+
+const SESSION_KEYS = {
+  UNLOCKED:    'synapse_unlocked',
+  SESSION_PIN: '_sessionPin',
 };
 
 // ── DOM refs ─────────────────────────────────────────────────────────────────
+const lockBtn             = document.getElementById('btn-lock');
 const settingsToggleBtn   = document.getElementById('btn-settings-toggle');
 const settingsView        = document.getElementById('view-settings');
 const mainViews           = document.getElementById('main-views');
+
+const lockScreen          = document.getElementById('lock-screen');
+const lockTitle           = document.getElementById('lock-title');
+const lockSubtitle        = document.getElementById('lock-subtitle');
+const pinForm             = document.getElementById('pin-form');
+const pinInputs           = document.querySelectorAll('.pin-digit');
+const pinInputsContainer  = document.getElementById('pin-inputs');
+const lockStatus          = document.getElementById('lock-status');
+const lockSubmitBtn       = document.getElementById('btn-lock-submit');
 
 const modelSelect         = document.getElementById('model-select');
 const customModelGroup    = document.getElementById('custom-model-group');
@@ -38,6 +54,20 @@ const keyInputs = {
   [STORAGE_KEYS.OPENAI_KEY]:  document.getElementById('key-openai'),
   [STORAGE_KEYS.GROQ_KEY]:    document.getElementById('key-groq'),
 };
+
+// Preserve default placeholders
+Object.values(keyInputs).forEach((inputEl) => {
+  if (inputEl) {
+    inputEl.dataset.defaultPlaceholder = inputEl.placeholder;
+    inputEl.addEventListener('input', () => {
+      if (inputEl.value === '' && inputEl.placeholder.includes('saved')) {
+        inputEl.dataset.cleared = 'true';
+      } else {
+        inputEl.dataset.cleared = 'false';
+      }
+    });
+  }
+});
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -87,56 +117,223 @@ settingsToggleBtn.addEventListener('click', () => {
   }
 });
 
-// ── Persist & restore API keys ───────────────────────────────────────────────
+// ── Web Crypto API (PBKDF2 & AES-GCM) ────────────────────────────────────────
 
 /**
- * Load saved API keys from chrome.storage.local and populate the input fields.
- * Uses the masking strategy: if a key exists, fill the field with a sentinel
- * placeholder so the user knows it's saved without exposing the value.
+ * Base64 encode an ArrayBuffer or Uint8Array.
+ * @param {ArrayBuffer|Uint8Array} buffer
+ * @returns {string}
+ */
+function bufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+/**
+ * Decode a Base64 string into a Uint8Array.
+ * @param {string} base64
+ * @returns {Uint8Array}
+ */
+function base64ToBuffer(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+/**
+ * Derive a 256-bit AES-GCM key from a 4-digit PIN string and salt using PBKDF2 (SHA-256, 600,000 iterations).
+ * @param {string} pin
+ * @param {Uint8Array|ArrayBuffer} salt
+ * @returns {Promise<CryptoKey>}
+ */
+export async function deriveKey(pin, salt) {
+  const enc = new TextEncoder();
+  const pinBytes = enc.encode(String(pin));
+
+  const baseKey = await crypto.subtle.importKey(
+    'raw',
+    pinBytes,
+    'PBKDF2',
+    false,
+    ['deriveKey']
+  );
+
+  const saltBuffer = salt instanceof Uint8Array ? salt : new Uint8Array(salt);
+
+  return crypto.subtle.deriveKey(
+    {
+      name: 'PBKDF2',
+      salt: saltBuffer,
+      iterations: 600000,
+      hash: 'SHA-256',
+    },
+    baseKey,
+    {
+      name: 'AES-GCM',
+      length: 256,
+    },
+    false,
+    ['encrypt', 'decrypt']
+  );
+}
+
+/**
+ * Encrypt a data payload (object or string) with a 4-digit PIN.
+ * Generates a 16-byte random salt and 12-byte random IV, derives the key,
+ * encrypts the payload, and saves the Base64-encoded ciphertext, salt, and iv to chrome.storage.local.
+ * @param {object|string} data
+ * @param {string} pin
+ * @returns {Promise<{ ciphertext: string, salt: string, iv: string }>}
+ */
+export async function encryptData(data, pin) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveKey(pin, salt);
+
+  const payloadStr = typeof data === 'string' ? data : JSON.stringify(data);
+  const payloadBytes = new TextEncoder().encode(payloadStr);
+
+  const ciphertextBuffer = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    key,
+    payloadBytes
+  );
+
+  const encryptedObj = {
+    ciphertext: bufferToBase64(ciphertextBuffer),
+    salt: bufferToBase64(salt),
+    iv: bufferToBase64(iv),
+  };
+
+  await chrome.storage.local.set({ [STORAGE_KEYS.ENCRYPTED_VAULT]: encryptedObj });
+  return encryptedObj;
+}
+
+/**
+ * Decrypt an encrypted vault object using a 4-digit PIN.
+ * Decodes Base64 values, derives the AES key using the stored salt, and decrypts the ciphertext with stored IV.
+ * @param {{ ciphertext: string, salt: string, iv: string }} encryptedObj
+ * @param {string} pin
+ * @returns {Promise<any>}
+ */
+export async function decryptData(encryptedObj, pin) {
+  if (!encryptedObj || !encryptedObj.ciphertext || !encryptedObj.salt || !encryptedObj.iv) {
+    throw new Error('Invalid encrypted object payload.');
+  }
+
+  const salt = base64ToBuffer(encryptedObj.salt);
+  const iv = base64ToBuffer(encryptedObj.iv);
+  const ciphertext = base64ToBuffer(encryptedObj.ciphertext);
+
+  const key = await deriveKey(pin, salt);
+
+  const decryptedBuffer = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv },
+    key,
+    ciphertext
+  );
+
+  const decryptedStr = new TextDecoder().decode(decryptedBuffer);
+  try {
+    return JSON.parse(decryptedStr);
+  } catch {
+    return decryptedStr;
+  }
+}
+
+// ── Persist & restore API keys (Session-only unencrypted storage) ─────────────
+
+/**
+ * Load saved API keys from chrome.storage.session and populate the input fields.
+ * Uses masking placeholders without exposing raw values.
  */
 async function loadSavedKeys() {
-  const storageKeyIds = Object.keys(keyInputs);
-  const stored = await chrome.storage.local.get(storageKeyIds);
+  const storageKeyIds = [
+    STORAGE_KEYS.GEMINI_KEY,
+    STORAGE_KEYS.CLAUDE_KEY,
+    STORAGE_KEYS.OPENAI_KEY,
+    STORAGE_KEYS.GROQ_KEY,
+  ];
+  const stored = await chrome.storage.session.get(storageKeyIds);
 
   for (const [storageKey, inputEl] of Object.entries(keyInputs)) {
     if (stored[storageKey]) {
-      // Show a placeholder indicating a key is already saved
       inputEl.placeholder = '••••••••  (saved)';
+    } else {
+      inputEl.placeholder = inputEl.dataset.defaultPlaceholder || '';
     }
   }
 }
 
 /**
- * Save all non-empty API key fields to chrome.storage.local.
- * Empty fields (where the user cleared the input) will delete the stored key.
+ * Save non-empty API key fields into chrome.storage.session,
+ * then encrypt the full key set using the active session PIN and persist to chrome.storage.local.
  */
 async function saveKeys() {
   saveKeysBtn.disabled = true;
 
   try {
-    const toSet    = {};
-    const toRemove = [];
+    const storageKeyIds = [
+      STORAGE_KEYS.GEMINI_KEY,
+      STORAGE_KEYS.CLAUDE_KEY,
+      STORAGE_KEYS.OPENAI_KEY,
+      STORAGE_KEYS.GROQ_KEY,
+    ];
+
+    const sessionStored = await chrome.storage.session.get([...storageKeyIds, SESSION_KEYS.SESSION_PIN]);
+    const pin = sessionStored[SESSION_KEYS.SESSION_PIN];
+
+    if (!pin) {
+      showStatus(saveStatus, '⚠ Vault locked. Enter PIN first.', 'warning');
+      showLockScreen(false);
+      return;
+    }
+
+    const currentKeys = {};
+    for (const k of storageKeyIds) {
+      if (sessionStored[k]) currentKeys[k] = sessionStored[k];
+    }
+
+    const toSessionSet    = {};
+    const toSessionRemove = [];
 
     for (const [storageKey, inputEl] of Object.entries(keyInputs)) {
       const val = inputEl.value.trim();
       if (val) {
-        toSet[storageKey] = val;
+        currentKeys[storageKey] = val;
+        toSessionSet[storageKey] = val;
         inputEl.value = '';
         inputEl.placeholder = '••••••••  (saved)';
-      } else if (inputEl.placeholder.includes('saved') && !val) {
-        // Field was intentionally cleared — remove stored key
-        toRemove.push(storageKey);
+      } else if (inputEl.dataset.cleared === 'true') {
+        delete currentKeys[storageKey];
+        toSessionRemove.push(storageKey);
+        inputEl.dataset.cleared = 'false';
+        inputEl.placeholder = inputEl.dataset.defaultPlaceholder || '';
       }
     }
 
-    if (Object.keys(toSet).length > 0) {
-      await chrome.storage.local.set(toSet);
+    // Encrypt updated keys and save encrypted payload to chrome.storage.local
+    await encryptData(currentKeys, pin);
+
+    // Save active unencrypted keys into chrome.storage.session
+    if (Object.keys(toSessionSet).length > 0) {
+      await chrome.storage.session.set(toSessionSet);
     }
-    if (toRemove.length > 0) {
-      await chrome.storage.local.remove(toRemove);
+    if (toSessionRemove.length > 0) {
+      await chrome.storage.session.remove(toSessionRemove);
     }
 
-    showStatus(saveStatus, '✓ Keys saved securely', 'success');
+    // Purge any legacy plaintext keys from local storage
+    await chrome.storage.local.remove(storageKeyIds);
+
+    showStatus(saveStatus, '✓ Keys encrypted & saved', 'success');
   } catch (err) {
     console.error('[Synapse] Failed to save keys:', err);
     showStatus(saveStatus, '✗ Save failed — see console', 'error');
@@ -240,6 +437,14 @@ function appendChunk(chunk) {
  * and wires onMessage / onDisconnect to stream chunks into the UI.
  */
 async function handleRelay() {
+  // Defensive check: Ensure vault is unlocked
+  const session = await chrome.storage.session.get([SESSION_KEYS.UNLOCKED]);
+  if (!session[SESSION_KEYS.UNLOCKED]) {
+    showStatus(relayStatus, '⚠ Please unlock Synapse first', 'warning');
+    showLockScreen(false);
+    return;
+  }
+
   const model = modelSelect.value;
   if (!model) {
     showStatus(relayStatus, '⚠ Please select a model first', 'warning');
@@ -381,13 +586,211 @@ stopBtn.addEventListener('click', () => {
   relayPort = null;
 });
 
+// ── Lock Screen UI & Event Wiring ──────────────────────────────────────────
+
+/**
+ * Display the Master PIN lock screen overlay.
+ * @param {boolean} [setupMode=false]
+ */
+function showLockScreen(setupMode = false) {
+  document.body.classList.add('is-locked');
+  lockScreen.hidden = false;
+  pinInputs.forEach((input) => { input.value = ''; });
+  lockStatus.textContent = '';
+  lockStatus.className = 'lock-status';
+
+  if (setupMode) {
+    lockTitle.textContent = 'Set Master PIN';
+    lockSubtitle.textContent = 'Create a 4-digit PIN to encrypt your API keys';
+    lockSubmitBtn.textContent = 'Set PIN';
+    lockScreen.dataset.mode = 'setup';
+  } else {
+    lockTitle.textContent = 'Unlock Synapse';
+    lockSubtitle.textContent = 'Enter your 4-digit Master PIN';
+    lockSubmitBtn.textContent = 'Unlock';
+    lockScreen.dataset.mode = 'unlock';
+  }
+
+  setTimeout(() => pinInputs[0]?.focus(), 50);
+}
+
+/**
+ * Hide the Master PIN lock screen overlay.
+ */
+function hideLockScreen() {
+  document.body.classList.remove('is-locked');
+  lockScreen.hidden = true;
+  pinInputs.forEach((input) => { input.value = ''; });
+  lockStatus.textContent = '';
+}
+
+/**
+ * Handle PIN submission for setup or unlocking.
+ */
+async function handlePinSubmit(e) {
+  if (e) e.preventDefault();
+
+  const pin = Array.from(pinInputs).map((input) => input.value).join('');
+  if (pin.length !== 4) {
+    lockStatus.textContent = 'Please enter all 4 digits.';
+    lockStatus.className = 'lock-status error';
+    pinInputsContainer.classList.add('shake');
+    setTimeout(() => pinInputsContainer.classList.remove('shake'), 400);
+    return;
+  }
+
+  const isSetup = lockScreen.dataset.mode === 'setup';
+  lockSubmitBtn.disabled = true;
+  lockStatus.textContent = isSetup ? 'Deriving key & setting PIN…' : 'Deriving key & verifying PIN…';
+  lockStatus.className = 'lock-status';
+
+  try {
+    if (isSetup) {
+      // Collect any legacy plaintext keys from chrome.storage.local
+      const legacyStored = await chrome.storage.local.get([
+        STORAGE_KEYS.GEMINI_KEY,
+        STORAGE_KEYS.CLAUDE_KEY,
+        STORAGE_KEYS.OPENAI_KEY,
+        STORAGE_KEYS.GROQ_KEY,
+      ]);
+
+      const initialKeys = {};
+      for (const [k, v] of Object.entries(legacyStored)) {
+        if (v) initialKeys[k] = v;
+      }
+
+      // Encrypt with new PIN and persist to chrome.storage.local
+      await encryptData(initialKeys, pin);
+
+      // Store in session storage
+      await chrome.storage.session.set({
+        ...initialKeys,
+        [SESSION_KEYS.UNLOCKED]: true,
+        [SESSION_KEYS.SESSION_PIN]: pin,
+      });
+
+      // Purge plaintext keys from local storage
+      await chrome.storage.local.remove([
+        STORAGE_KEYS.GEMINI_KEY,
+        STORAGE_KEYS.CLAUDE_KEY,
+        STORAGE_KEYS.OPENAI_KEY,
+        STORAGE_KEYS.GROQ_KEY,
+      ]);
+
+      hideLockScreen();
+      await loadSavedKeys();
+      showStatus(relayStatus, '✓ Master PIN set & vault unlocked', 'success');
+    } else {
+      // Unlock mode: read encrypted vault from chrome.storage.local
+      const { [STORAGE_KEYS.ENCRYPTED_VAULT]: encryptedVault } = await chrome.storage.local.get(STORAGE_KEYS.ENCRYPTED_VAULT);
+      if (!encryptedVault) {
+        showLockScreen(true);
+        return;
+      }
+
+      const decryptedKeys = await decryptData(encryptedVault, pin);
+
+      // Decryption succeeded — store keys only in session storage
+      const sessionPayload = {
+        [SESSION_KEYS.UNLOCKED]: true,
+        [SESSION_KEYS.SESSION_PIN]: pin,
+      };
+      if (decryptedKeys && typeof decryptedKeys === 'object') {
+        Object.assign(sessionPayload, decryptedKeys);
+      }
+
+      await chrome.storage.session.set(sessionPayload);
+      hideLockScreen();
+      await loadSavedKeys();
+      showStatus(relayStatus, '✓ Synapse unlocked', 'success');
+    }
+  } catch (err) {
+    console.warn('[Synapse] PIN verification failed:', err);
+    lockStatus.textContent = isSetup ? 'Failed to set PIN.' : 'Incorrect PIN. Please try again.';
+    lockStatus.className = 'lock-status error';
+    pinInputsContainer.classList.add('shake');
+    setTimeout(() => pinInputsContainer.classList.remove('shake'), 400);
+    pinInputs.forEach((input) => { input.value = ''; });
+    pinInputs[0]?.focus();
+  } finally {
+    lockSubmitBtn.disabled = false;
+  }
+}
+
+// PIN inputs navigation (auto-advance, backspace, paste)
+pinInputs.forEach((input, index) => {
+  input.addEventListener('input', (e) => {
+    const val = e.target.value.replace(/[^0-9]/g, '');
+    e.target.value = val ? val[val.length - 1] : '';
+
+    if (e.target.value) {
+      if (index < pinInputs.length - 1) {
+        pinInputs[index + 1].focus();
+      } else {
+        handlePinSubmit();
+      }
+    }
+  });
+
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Backspace' && !input.value && index > 0) {
+      pinInputs[index - 1].focus();
+    }
+  });
+
+  input.addEventListener('paste', (e) => {
+    e.preventDefault();
+    const pasteData = (e.clipboardData || window.clipboardData).getData('text').trim();
+    const digits = pasteData.replace(/[^0-9]/g, '').slice(0, 4);
+    if (!digits) return;
+
+    digits.split('').forEach((d, i) => {
+      if (pinInputs[i]) pinInputs[i].value = d;
+    });
+
+    if (digits.length === 4) {
+      pinInputs[3].focus();
+      handlePinSubmit();
+    } else if (pinInputs[digits.length]) {
+      pinInputs[digits.length].focus();
+    }
+  });
+});
+
+pinForm.addEventListener('submit', handlePinSubmit);
+
+// Lock button: wipe session and show lock screen
+if (lockBtn) {
+  lockBtn.addEventListener('click', async () => {
+    await chrome.storage.session.clear();
+    for (const inputEl of Object.values(keyInputs)) {
+      inputEl.value = '';
+      inputEl.placeholder = inputEl.dataset.defaultPlaceholder || '';
+    }
+    closeSettings();
+    showLockScreen(false);
+  });
+}
+
 // ── Init ─────────────────────────────────────────────────────────────────────
 
 async function init() {
-  await Promise.all([
-    loadSavedKeys(),
-    restoreLastModel(),
-  ]);
+  // 1. Check if already unlocked in active Chrome session
+  const session = await chrome.storage.session.get([SESSION_KEYS.UNLOCKED]);
+  if (session[SESSION_KEYS.UNLOCKED]) {
+    hideLockScreen();
+    await loadSavedKeys();
+  } else {
+    // 2. Check if encrypted vault exists in local storage
+    const local = await chrome.storage.local.get([STORAGE_KEYS.ENCRYPTED_VAULT]);
+    if (local[STORAGE_KEYS.ENCRYPTED_VAULT]) {
+      showLockScreen(false); // Unlock mode
+    } else {
+      showLockScreen(true);  // Initial setup mode
+    }
+  }
+
+  await restoreLastModel();
 }
 
 init();

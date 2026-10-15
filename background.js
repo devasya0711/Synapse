@@ -249,14 +249,13 @@ async function attemptFetch(adapter, modelName, messages, overrideKey = null) {
   // ── Retrieve the API key ───────────────────────────────────────────────
   let apiKey = overrideKey;
   if (!apiKey) {
-    const stored = await chrome.storage.session.get(adapter.storageKey)
-      .catch(() => chrome.storage.local.get(adapter.storageKey));
+    const stored = await chrome.storage.session.get(adapter.storageKey);
     apiKey = stored[adapter.storageKey];
   }
 
   if (!apiKey || apiKey === 'ENTER_KEY_HERE') {
     throw new Error(
-      `No API key found for ${adapter.storageKey}. Please save your key in Settings.`
+      `No active API key found for ${adapter.storageKey}. Please unlock Synapse with your Master PIN or configure your key in Settings.`
     );
   }
 
