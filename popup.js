@@ -19,9 +19,13 @@ const settingsView        = document.getElementById('view-settings');
 const mainViews           = document.getElementById('main-views');
 
 const modelSelect         = document.getElementById('model-select');
+const customModelGroup    = document.getElementById('custom-model-group');
+const customModelInput    = document.getElementById('custom-model-input');
 const relayBtn            = document.getElementById('btn-relay');
+const stopBtn             = document.getElementById('btn-stop');
 const relayStatus         = document.getElementById('relay-status');
 const responseContainer   = document.getElementById('response-container');
+const modelBadge          = document.getElementById('model-badge');
 
 const saveKeysBtn         = document.getElementById('btn-save-keys');
 const saveStatus          = document.getElementById('save-status');
@@ -162,11 +166,20 @@ async function restoreLastModel() {
     modelSelect.value = lastModel;
   }
   updateRecommendedBadge(modelSelect.value);
+  toggleCustomModelInput(modelSelect.value);
+}
+
+/** Show/hide the custom model text input based on the selected option. */
+function toggleCustomModelInput(value) {
+  const isCustom = value.startsWith('__custom_');
+  customModelGroup.hidden = !isCustom;
+  if (!isCustom) customModelInput.value = '';
 }
 
 modelSelect.addEventListener('change', async () => {
   await chrome.storage.local.set({ [STORAGE_KEYS.LAST_MODEL]: modelSelect.value });
   updateRecommendedBadge(modelSelect.value);
+  toggleCustomModelInput(modelSelect.value);
 });
 
 /**
@@ -175,14 +188,18 @@ modelSelect.addEventListener('change', async () => {
  */
 function updateRecommendedBadge(modelValue) {
   const labels = {
-    'gemini-2.0-flash':  'Gemini 2.0 Flash',
-    'gemini-1.5-pro':    'Gemini 1.5 Pro',
-    'claude-sonnet-4-5': 'Claude Sonnet 4.5',
-    'claude-opus-4':     'Claude Opus 4',
-    'gpt-4o':            'GPT-4o',
-    'gpt-4o-mini':       'GPT-4o Mini',
-    'llama-3.3-70b':     'Llama 3.3 70B',
-    'mixtral-8x7b':      'Mixtral 8x7B',
+    'claude-3-7-sonnet-20250219': 'Claude 3.7 Sonnet',
+    'claude-3-opus-20240229':     'Claude 3 Opus',
+    'gemini-2.0-flash':           'Gemini 2.0 Flash',
+    'gemini-1.5-pro':             'Gemini 1.5 Pro',
+    'gpt-4o':                     'GPT-4o',
+    'gpt-4o-mini':                'GPT-4o Mini',
+    'o1':                         'o1',
+    'llama-3.3-70b-versatile':    'Llama 3.3 70B',
+    'llama-3.1-8b-instant':       'Llama 3.1 8B Instant',
+    '__custom_anthropic__':       'Custom Anthropic',
+    '__custom_gemini__':          'Custom Gemini',
+    '__custom_openai__':          'Custom OpenAI',
   };
   recommendedBadge.textContent = labels[modelValue] ?? '—';
 }
@@ -193,12 +210,14 @@ function updateRecommendedBadge(modelValue) {
 let relayPort = null;
 
 /**
- * Reset the response container to empty and hide it.
+ * Reset the response container to empty and hide it, and clear the model badge.
  */
 function clearResponseContainer() {
   responseContainer.textContent = '';
   responseContainer.hidden = true;
   responseContainer.classList.remove('streaming');
+  modelBadge.hidden = true;
+  modelBadge.textContent = '';
 }
 
 /**
@@ -227,6 +246,15 @@ async function handleRelay() {
     return;
   }
 
+  // If custom provider, require a model string
+  const isCustom    = model.startsWith('__custom_');
+  const customModel = customModelInput.value.trim();
+  if (isCustom && !customModel) {
+    showStatus(relayStatus, '⚠ Please enter a custom model ID', 'warning');
+    customModelInput.focus();
+    return;
+  }
+
   // Prevent concurrent relay sessions
   if (relayPort) {
     showStatus(relayStatus, '⚠ A relay is already in progress', 'warning');
@@ -234,6 +262,7 @@ async function handleRelay() {
   }
 
   relayBtn.disabled = true;
+  stopBtn.disabled  = false;
   clearResponseContainer();
   showStatus(relayStatus, 'Connecting…', '');
 
@@ -251,11 +280,38 @@ async function handleRelay() {
           appendChunk(msg.text);
           break;
 
+        case 'clear':
+          // Background signalling a cascade reset — wipe partially rendered tokens
+          responseContainer.textContent = '';
+          responseContainer.hidden = true;
+          responseContainer.classList.remove('streaming');
+          break;
+
+        case 'status':
+          // Cascade status update + optional badge
+          showStatus(relayStatus, msg.message, 'warning', 6000);
+          if (msg.badge) {
+            modelBadge.textContent = `▶ ${msg.badge}`;
+            modelBadge.hidden = false;
+          }
+          break;
+
+        case 'badge':
+          // Model that actually fulfilled the request
+          modelBadge.textContent = `✓ Fulfilled by: ${msg.badge}`;
+          modelBadge.hidden = false;
+          break;
+
+        case 'ping':
+          // Keep-alive from background — no UI action needed
+          break;
+
         case 'DONE':
           responseContainer.classList.remove('streaming');
           showStatus(relayStatus, '✓ Stream complete', 'success');
           flashCounter();
           relayBtn.disabled = false;
+          stopBtn.disabled  = true;
           relayPort = null;
           break;
 
@@ -263,7 +319,18 @@ async function handleRelay() {
           responseContainer.classList.remove('streaming');
           showStatus(relayStatus, `✗ ${msg.message}`, 'error');
           relayBtn.disabled = false;
+          stopBtn.disabled  = true;
           relayPort = null;
+          break;
+
+        case 'RECOMMENDATION':
+          if (recommendedBadge && msg.recommendation) {
+            recommendedBadge.textContent = msg.recommendation;
+          }
+          if (tokenCounter && msg.tokens != null) {
+            tokenCounter.textContent = msg.tokens.toLocaleString();
+            flashCounter();
+          }
           break;
 
         default:
@@ -283,22 +350,36 @@ async function handleRelay() {
         showStatus(relayStatus, '⚠ Connection closed before stream finished', 'warning');
       }
       relayBtn.disabled = false;
+      stopBtn.disabled  = true;
       relayPort = null;
     });
 
     // ── Send the relay trigger through the port ─────────────────
-    relayPort.postMessage({ type: 'RELAY_CONTEXT', model, tabId: tab.id });
+    relayPort.postMessage({ type: 'RELAY_CONTEXT', model, customModel: customModel || undefined, tabId: tab.id });
     showStatus(relayStatus, 'Streaming…', '');
 
   } catch (err) {
     console.error('[Synapse] Relay error:', err);
     showStatus(relayStatus, `✗ ${err.message}`, 'error');
     relayBtn.disabled = false;
+    stopBtn.disabled  = true;
     relayPort = null;
   }
 }
 
 relayBtn.addEventListener('click', handleRelay);
+
+/** Send ABORT_STREAM through the active port when Stop is clicked. */
+stopBtn.addEventListener('click', () => {
+  if (relayPort) {
+    try { relayPort.postMessage({ type: 'ABORT_STREAM' }); } catch { /* port closed */ }
+  }
+  relayBtn.disabled = false;
+  stopBtn.disabled  = true;
+  responseContainer.classList.remove('streaming');
+  showStatus(relayStatus, '⏹ Stream stopped', 'warning');
+  relayPort = null;
+});
 
 // ── Init ─────────────────────────────────────────────────────────────────────
 

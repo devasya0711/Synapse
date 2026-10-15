@@ -6,33 +6,61 @@
  *   2. Inject content.js, extract ChatGPT context from the active tab.
  *   3. Route the extracted messages through the selected provider adapter.
  *   4. Stream SSE chunks back to the popup via port.postMessage.
- *   5. On 429 / 503, automatically retry with the Groq fallback adapter.
+ *   5. Cascade fallback: primary → Groq (GROQ_FREE_KEY) → Gemini Flash (GEMINI_FREE_KEY).
+ *   6. Keep-alive ping every 20s to prevent MV3 service-worker termination.
  */
 
-import { ModelAdapters, FALLBACK_MODEL } from './adapters.js';
+import { ModelAdapters, CUSTOM_PROVIDER_MAP, FALLBACK_MODEL, pruneContext } from './adapters.js';
+
+// ── Fallback config (hardcoded free-tier keys) ────────────────────────────────
+
+const FALLBACK_CONFIG = {
+  GROQ_FREE_KEY:   'ENTER_KEY_HERE',
+  GEMINI_FREE_KEY: 'ENTER_KEY_HERE',
+};
 
 // ── Port listener (popup → background) ──────────────────────────────────────
+
+/** Tracks the active AbortController so ABORT_STREAM can cancel it. */
+let activeAbortController = null;
 
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== 'relay-port') return;
 
   port.onMessage.addListener(async (msg) => {
+    // ── Abort signal ───────────────────────────────────────────────────────
+    if (msg.type === 'ABORT_STREAM') {
+      if (activeAbortController) {
+        activeAbortController.abort();
+        activeAbortController = null;
+      }
+      return;
+    }
+
     if (msg.type !== 'RELAY_CONTEXT') return;
 
-    const { model, tabId } = msg;
+    const { model, customModel, tabId } = msg;
+
+    // ── MV3 Keep-alive: ping every 20 s while streaming ───────────────────
+    const keepAliveInterval = setInterval(() => {
+      try { port.postMessage({ type: 'ping' }); } catch { /* port closed */ }
+    }, 20_000);
 
     try {
       // 1. Extract context from the active tab via the content script
       const messages = await extractContext(tabId);
 
-      // 2. Relay through the selected model adapter (with fallback logic)
-      await relayContext(port, messages, model);
+      // 2. Relay through the selected model adapter (with fallback cascade)
+      await relayContext(port, messages, model, customModel);
 
       // 3. Signal completion
       port.postMessage({ type: 'DONE' });
     } catch (err) {
       console.error('[Synapse] Relay pipeline failed:', err);
       port.postMessage({ type: 'ERROR', message: err.message ?? String(err) });
+    } finally {
+      clearInterval(keepAliveInterval);
+      activeAbortController = null;
     }
   });
 });
@@ -175,59 +203,71 @@ export function recommendModel(messages, port = null) {
 
 // ── Relay context to an LLM provider ────────────────────────────────────────
 
+/** Model context-window limits used for pruneContext (tokens). */
+const MODEL_TOKEN_LIMITS = {
+  default:                      128_000,
+  'claude-3-7-sonnet-20250219': 200_000,
+  'claude-3-opus-20240229':     200_000,
+  'gemini-2.0-flash':         1_000_000,
+  'gemini-1.5-pro':           2_000_000,
+  'gpt-4o':                     128_000,
+  'gpt-4o-mini':                128_000,
+  'o1':                         128_000,
+  'llama-3.3-70b-versatile':    128_000,
+  'llama-3.1-8b-instant':         8_000,
+};
+
 /**
- * Fetch a streaming response from the chosen provider and relay SSE chunks
- * to the popup through `port.postMessage({ type: 'CHUNK', text })`.
- *
- * On HTTP 429 (Rate Limit) or 503 (Overload), the function logs a warning
- * and recursively retries with the Groq Llama 3 fallback adapter.
- *
- * @param {chrome.runtime.Port} port       – long-lived port to the popup
- * @param {{ role: string, text: string }[]} messages – generic conversation
- * @param {string} modelName               – model key from ModelAdapters
- * @param {boolean} [isFallback=false]      – true when this is the retry call
+ * Resolve adapter + effective model string for a given model value.
+ * Handles both normal model IDs and __custom_*__ sentinels.
+ * @param {string} modelValue
+ * @param {string} [customStr]
+ * @returns {{ adapter: object, modelName: string }}
  */
-async function relayContext(port, messages, modelName, isFallback = false) {
-  const adapter = ModelAdapters[modelName];
-  if (!adapter) {
-    throw new Error(`Unknown model "${modelName}". No adapter found.`);
+function resolveAdapter(modelValue, customStr) {
+  if (ModelAdapters[modelValue]) {
+    return { adapter: ModelAdapters[modelValue], modelName: modelValue };
+  }
+  const customAdapter = CUSTOM_PROVIDER_MAP?.[modelValue];
+  if (customAdapter) {
+    const modelName = (customStr ?? '').trim();
+    if (!modelName) throw new Error('Custom model selected but no model ID was provided.');
+    return { adapter: customAdapter, modelName };
+  }
+  throw new Error(`Unknown model "${modelValue}". No adapter found.`);
+}
+
+/**
+ * Execute a single SSE fetch, attach the AbortController, and return the Response.
+ * @param {object} adapter
+ * @param {string} modelName
+ * @param {{ role: string, text: string }[]} messages
+ * @param {string|null} [overrideKey]  – bypass storage lookup (used for fallback keys)
+ * @returns {Promise<Response>}
+ */
+async function attemptFetch(adapter, modelName, messages, overrideKey = null) {
+  // ── Retrieve the API key ───────────────────────────────────────────────
+  let apiKey = overrideKey;
+  if (!apiKey) {
+    const stored = await chrome.storage.session.get(adapter.storageKey)
+      .catch(() => chrome.storage.local.get(adapter.storageKey));
+    apiKey = stored[adapter.storageKey];
   }
 
-  // ── Pre-fetch: scrub PII, estimate tokens & recommend model ────────────
-  const scrubbedMessages = messages.map((m) => ({
-    ...m,
-    text: scrubPII(m.text),
-  }));
-
-  const fullText = scrubbedMessages.map((m) => m.text).join('\n');
-  const tokenCount = estimateTokens(fullText);
-  const recommendation = recommendModel(scrubbedMessages, port);
-
-  // ── Retrieve the API key from storage ──────────────────────────────────
-  const { [adapter.storageKey]: apiKey } =
-    await chrome.storage.local.get(adapter.storageKey);
-
-  if (!apiKey) {
+  if (!apiKey || apiKey === 'ENTER_KEY_HERE') {
     throw new Error(
-      `No API key found for ${adapter.storageKey}. ` +
-      'Please save your key in Settings.'
+      `No API key found for ${adapter.storageKey}. Please save your key in Settings.`
     );
   }
 
-  // ── Build the request ──────────────────────────────────────────────────
-  const payload = adapter.formatPayload(scrubbedMessages, modelName);
-
-  // Gemini puts the key in the URL; everyone else uses an Authorization header.
-  const url = adapter.buildURL
+  // ── Build request ──────────────────────────────────────────────────────
+  const payload = adapter.formatPayload(messages, modelName);
+  const url     = adapter.buildURL
     ? adapter.buildURL(modelName, apiKey)
     : adapter.endpoint;
 
-  const headers = {
-    'Content-Type': 'application/json',
-  };
-
+  const headers = { 'Content-Type': 'application/json' };
   if (!adapter.buildURL) {
-    // Standard Bearer auth (OpenAI, Groq) or Anthropic's x-api-key
     if (adapter.storageKey === 'apiKey_claude') {
       headers['x-api-key']         = apiKey;
       headers['anthropic-version'] = '2023-06-01';
@@ -236,65 +276,113 @@ async function relayContext(port, messages, modelName, isFallback = false) {
     }
   }
 
-  // ── Fetch with SSE streaming ───────────────────────────────────────────
+  // ── AbortController ────────────────────────────────────────────────────
+  const controller = new AbortController();
+  activeAbortController = controller;
+
+  return fetch(url, {
+    method:  'POST',
+    headers,
+    body:    JSON.stringify(payload),
+    signal:  controller.signal,
+  });
+}
+
+/**
+ * Fetch a streaming response from the chosen provider and relay SSE chunks
+ * to the popup through `port.postMessage({ type: 'CHUNK', text })`.
+ *
+ * Cascading fallback order on 429 / 5xx / network error:
+ *   primary  →  Groq (GROQ_FREE_KEY)  →  Gemini Flash (GEMINI_FREE_KEY)
+ *
+ * @param {chrome.runtime.Port} port
+ * @param {{ role: string, text: string }[]} messages
+ * @param {string} modelValue   – value from the model select
+ * @param {string} [customStr]  – user-typed custom model ID (if sentinel)
+ */
+async function relayContext(port, messages, modelValue, customStr) {
+  const { adapter, modelName } = resolveAdapter(modelValue, customStr);
+
+  // ── Pre-fetch: scrub PII, prune context ───────────────────────────────
+  let scrubbedMessages = messages.map((m) => ({ ...m, text: scrubPII(m.text) }));
+
+  const tokenLimit = MODEL_TOKEN_LIMITS[modelName] ?? MODEL_TOKEN_LIMITS.default;
+  scrubbedMessages  = pruneContext(scrubbedMessages, tokenLimit);
+
+  const tokenCount = estimateTokens(scrubbedMessages.map((m) => m.text).join('\n'));
+  recommendModel(scrubbedMessages, port);
+
+  console.log(`[Synapse] relayContext — model: ${modelName}, est. tokens: ${tokenCount}`);
+
+  // ── Helper: send clear + cascade status through port ──────────────────
+  const sendCascadeStatus = (message, badge) => {
+    try {
+      port.postMessage({ type: 'clear' });
+      port.postMessage({ type: 'status', message, badge });
+    } catch { /* port may have closed */ }
+  };
+
+  // ── Attempt 1: primary ────────────────────────────────────────────────
   try {
-    const response = await fetch(url, {
-      method:  'POST',
-      headers,
-      body:    JSON.stringify(payload),
-    });
-
-    // ── Handle rate-limit / overload with fallback ─────────────────────
-    if (response.status === 429 || response.status === 503) {
-      const statusText = response.status === 429 ? 'Rate Limited' : 'Overloaded';
-      console.warn(
-        `[Synapse] ${statusText} (${response.status}) from ${modelName}.`
-      );
-      port.postMessage({
-        type: 'CHUNK',
-        text: `\n⚠ ${statusText} on ${modelName}. Switching to fallback…\n\n`,
-      });
-
-      if (isFallback) {
-        throw new Error(
-          `Fallback model "${modelName}" also returned ${response.status}. Giving up.`
-        );
-      }
-
-      // Recursive retry with the Groq fallback
-      return relayContext(port, scrubbedMessages, FALLBACK_MODEL, true);
+    const response = await attemptFetch(adapter, modelName, scrubbedMessages);
+    if (response.ok) {
+      port.postMessage({ type: 'badge', badge: modelName });
+      await processSSEStream(response.body, port, adapter);
+      return;
     }
-
-    if (!response.ok) {
-      const errorBody = await response.text().catch(() => '(unreadable body)');
-      throw new Error(
-        `API error ${response.status}: ${errorBody.slice(0, 300)}`
-      );
+    if (!(response.status === 429 || response.status >= 500)) {
+      const body = await response.text().catch(() => '(unreadable)');
+      throw new Error(`API error ${response.status}: ${body.slice(0, 300)}`);
     }
-
-    // ── Stream SSE from the ReadableStream ────────────────────────────
-    await processSSEStream(response.body, port, adapter);
-
+    console.warn(`[Synapse] Primary failed (${response.status}). Cascading to Groq…`);
   } catch (err) {
-    // Network errors, JSON parse failures, etc.
-    if (err.message?.includes('Fallback model') || err.message?.includes('API error')) {
-      throw err; // Already handled — propagate
-    }
-
-    console.error(`[Synapse] Fetch error for ${modelName}:`, err);
-
-    // If the primary call fails with a non-HTTP error, try the fallback
-    if (!isFallback) {
-      console.warn('[Synapse] Network error — switching to fallback…');
-      port.postMessage({
-        type: 'CHUNK',
-        text: `\n⚠ Network error on ${modelName}. Switching to fallback…\n\n`,
-      });
-      return relayContext(port, scrubbedMessages, FALLBACK_MODEL, true);
-    }
-
-    throw err;
+    if (err.name === 'AbortError') throw new Error('Stream aborted by user.');
+    if (err.message?.startsWith('API error') || err.message?.includes('model ID')) throw err;
+    console.warn(`[Synapse] Primary network error (${modelName}):`, err);
   }
+
+  // ── Attempt 2: Groq fallback ──────────────────────────────────────────
+  sendCascadeStatus('Primary failed. Cascading to Groq…', 'Groq Llama 3 (Fallback)');
+
+  const groqAdapter = ModelAdapters[FALLBACK_MODEL];
+  let groqOk = false;
+  try {
+    const groqResponse = await attemptFetch(
+      groqAdapter, FALLBACK_MODEL, scrubbedMessages, FALLBACK_CONFIG.GROQ_FREE_KEY
+    );
+    if (groqResponse.ok) {
+      port.postMessage({ type: 'badge', badge: `Groq ${FALLBACK_MODEL} (Fallback)` });
+      await processSSEStream(groqResponse.body, port, groqAdapter);
+      groqOk = true;
+    } else {
+      console.warn(`[Synapse] Groq fallback failed (${groqResponse.status}). Cascading to Gemini…`);
+    }
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error('Stream aborted by user.');
+    console.warn('[Synapse] Groq fallback network error:', err);
+  }
+
+  if (groqOk) return;
+
+  // ── Attempt 3: Gemini Flash last resort ───────────────────────────────
+  sendCascadeStatus('Groq failed. Cascading to Gemini Flash…', 'Gemini Flash (Fallback)');
+
+  const geminiAdapter  = ModelAdapters['gemini-2.0-flash'];
+  const geminiModel    = 'gemini-2.0-flash';
+  const geminiResponse = await attemptFetch(
+    geminiAdapter, geminiModel, scrubbedMessages, FALLBACK_CONFIG.GEMINI_FREE_KEY
+  );
+
+  if (geminiResponse.ok) {
+    port.postMessage({ type: 'badge', badge: 'Gemini 2.0 Flash (Fallback)' });
+    await processSSEStream(geminiResponse.body, port, geminiAdapter);
+    return;
+  }
+
+  const errBody = await geminiResponse.text().catch(() => '(unreadable)');
+  throw new Error(
+    `All providers failed. Last error — Gemini ${geminiResponse.status}: ${errBody.slice(0, 200)}`
+  );
 }
 
 // ── SSE stream processor ────────────────────────────────────────────────────

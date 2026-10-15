@@ -372,6 +372,59 @@ body {
 
 .btn-icon { font-size: 15px; }
 
+/* ── Relay action row (Relay + Stop buttons) ──────────────────────────────── */
+.relay-actions {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.relay-actions .btn-primary {
+  flex: 1;
+}
+
+.btn-stop {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 14px;
+  border-radius: var(--radius-md);
+  background: rgba(248, 113, 113, 0.12);
+  border: 1px solid rgba(248, 113, 113, 0.35);
+  color: var(--danger);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--transition), box-shadow var(--transition);
+  white-space: nowrap;
+}
+
+.btn-stop:hover:not(:disabled) {
+  background: rgba(248, 113, 113, 0.22);
+  box-shadow: 0 0 12px rgba(248, 113, 113, 0.3);
+}
+
+.btn-stop:disabled {
+  opacity: 0.38;
+  cursor: not-allowed;
+}
+
+/* ── Model fulfillment badge ──────────────────────────────────────────────── */
+.model-fulfillment-badge {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  text-align: center;
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-glass);
+  border: 1px solid var(--border);
+  margin-top: 6px;
+  letter-spacing: 0.1px;
+  transition: opacity var(--transition);
+}
+
 /* ── Status Bar ─────────────────────────────────────────────── */
 .status-bar {
   font-size: 11.5px;

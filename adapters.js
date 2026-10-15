@@ -114,23 +114,68 @@ const groq = {
 // ── Public map: model-select value → adapter ─────────────────────────────────
 
 export const ModelAdapters = {
-  // OpenAI
-  'gpt-4o':            openai,
-  'gpt-4o-mini':       openai,
-
   // Anthropic
-  'claude-sonnet-4-5': anthropic,
-  'claude-opus-4':     anthropic,
+  'claude-3-7-sonnet-20250219': anthropic,
+  'claude-3-opus-20240229':     anthropic,
+
+  // OpenAI
+  'gpt-4o':                     openai,
+  'gpt-4o-mini':                openai,
+  'o1':                         openai,
 
   // Google Gemini
-  'gemini-2.0-flash':  gemini,
-  'gemini-1.5-pro':    gemini,
+  'gemini-2.0-flash':           gemini,
+  'gemini-1.5-pro':             gemini,
 
   // Groq (fast inference)
-  'llama-3.3-70b':     groq,
-  'mixtral-8x7b':      groq,
+  'llama-3.3-70b-versatile':    groq,
+  'llama-3.1-8b-instant':       groq,
 };
 
 // ── Fallback model constant ─────────────────────────────────────────────────
-/** Model to use when the primary provider returns 429/503. */
-export const FALLBACK_MODEL = 'llama-3.3-70b';
+/** Model to use when the primary provider returns 429/5xx or network error. */
+export const FALLBACK_MODEL = 'llama-3.3-70b-versatile';
+
+// ── Custom provider sentinel → adapter resolver ─────────────────────────────
+/**
+ * Maps the __custom_*__ sentinel option values to their provider adapter.
+ * The UI populates this when the user selects a "Custom…" option.
+ */
+export const CUSTOM_PROVIDER_MAP = {
+  '__custom_anthropic__': anthropic,
+  '__custom_gemini__':    gemini,
+  '__custom_openai__':    openai,
+};
+
+// ── Context pruning ─────────────────────────────────────────────────────────
+/**
+ * If the estimated token count of `messages` exceeds 80 % of `maxTokens`,
+ * preserve the system prompt and the 3 most recent turns, replacing the
+ * truncated middle with a '[...Context Pruned...]' sentinel.
+ *
+ * Token estimation: character-length / 4.
+ *
+ * @param {{ role: string, text: string }[]} messages
+ * @param {number} maxTokens  – model context limit
+ * @returns {{ role: string, text: string }[]}
+ */
+export function pruneContext(messages, maxTokens) {
+  const fullText   = messages.map((m) => m.text).join('\n');
+  const tokenEst   = Math.ceil(fullText.length / 4);
+  const threshold  = maxTokens * 0.8;
+
+  if (tokenEst <= threshold) return messages;
+
+  // Keep system message (if first message has role 'system') + last 3 turns
+  const [first, ...rest] = messages;
+  const isSystem = first?.role === 'system';
+  const head     = isSystem ? [first] : [];
+  const tail     = (isSystem ? rest : messages).slice(-3);
+
+  const pruned = [
+    ...head,
+    { role: 'system', text: '[...Context Pruned...]' },
+    ...tail,
+  ];
+  return pruned;
+}
