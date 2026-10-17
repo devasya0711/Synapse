@@ -83,6 +83,39 @@ async function updateSessionStreamStatus(isStreaming, statusMessage = '', status
   }
 }
 
+/**
+ * Detect whether a tab URL is restricted from extension script injection or DOM extraction.
+ * @param {string} url
+ * @returns {boolean}
+ */
+export function isRestrictedUrl(url) {
+  if (!url || typeof url !== 'string') return true;
+  const lowercaseUrl = url.toLowerCase().trim();
+  if (
+    lowercaseUrl.startsWith('chrome://') ||
+    lowercaseUrl.startsWith('chrome-extension://') ||
+    lowercaseUrl.startsWith('about:') ||
+    lowercaseUrl.startsWith('edge://')
+  ) {
+    return true;
+  }
+  if (
+    lowercaseUrl.includes('chromewebstore.google.com') ||
+    lowercaseUrl.includes('chrome.google.com/webstore')
+  ) {
+    return true;
+  }
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return true;
+    }
+  } catch {
+    return true;
+  }
+  return false;
+}
+
 // ── Port listener (popup → background) ──────────────────────────────────────
 
 chrome.runtime.onConnect.addListener((port) => {
@@ -116,39 +149,6 @@ chrome.runtime.onConnect.addListener((port) => {
       await updateSessionStreamStatus(false, '⏹ Stream stopped', 'warning');
       return;
     }
-
-/**
- * Detect whether a tab URL is restricted from extension script injection or DOM extraction.
- * @param {string} url
- * @returns {boolean}
- */
-export function isRestrictedUrl(url) {
-  if (!url || typeof url !== 'string') return true;
-  const lowercaseUrl = url.toLowerCase().trim();
-  if (
-    lowercaseUrl.startsWith('chrome://') ||
-    lowercaseUrl.startsWith('chrome-extension://') ||
-    lowercaseUrl.startsWith('about:') ||
-    lowercaseUrl.startsWith('edge://')
-  ) {
-    return true;
-  }
-  if (
-    lowercaseUrl.includes('chromewebstore.google.com') ||
-    lowercaseUrl.includes('chrome.google.com/webstore')
-  ) {
-    return true;
-  }
-  try {
-    const parsed = new URL(url);
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      return true;
-    }
-  } catch {
-    return true;
-  }
-  return false;
-}
 
     if (msg.type !== 'RELAY_CONTEXT') return;
 
