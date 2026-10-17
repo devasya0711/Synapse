@@ -730,6 +730,7 @@ function setupPortListeners(port) {
           restrictedTabBanner.hidden = false;
         }
         isRelaying = false;
+        currentPopupState.isStreaming = false;
         stopBtn.disabled = true;
         relayPort = null;
         setRelayButtonLoading(false);
@@ -742,6 +743,7 @@ function setupPortListeners(port) {
         showStatus(relayStatus, '✓ Stream complete', 'success');
         flashCounter();
         isRelaying = false;
+        currentPopupState.isStreaming = false;
         stopBtn.disabled  = true;
         relayPort = null;
         updatePopupState({
@@ -756,6 +758,7 @@ function setupPortListeners(port) {
         responseContainer.classList.remove('streaming');
         showStatus(relayStatus, `✗ ${msg.message}`, 'error');
         isRelaying = false;
+        currentPopupState.isStreaming = false;
         stopBtn.disabled  = true;
         relayPort = null;
         updatePopupState({
@@ -810,6 +813,7 @@ function setupPortListeners(port) {
     }
     relayPort = null;
     isRelaying = false;
+    currentPopupState.isStreaming = false;
     stopBtn.disabled = true;
     setRelayButtonLoading(false);
   });
@@ -906,6 +910,7 @@ async function handleRelay() {
     console.error('[Synapse] Relay error:', err);
     showStatus(relayStatus, `✗ ${err.message}`, 'error');
     isRelaying = false;
+    currentPopupState.isStreaming = false;
     setRelayButtonLoading(false);
     stopBtn.disabled  = true;
     relayPort = null;
@@ -921,6 +926,7 @@ stopBtn.addEventListener('click', () => {
     try { relayPort.postMessage({ type: 'ABORT_STREAM' }); } catch { /* port closed */ }
   }
   isRelaying = false;
+  currentPopupState.isStreaming = false;
   setRelayButtonLoading(false);
   stopBtn.disabled  = true;
   responseContainer.classList.remove('streaming');

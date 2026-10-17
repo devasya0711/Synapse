@@ -458,7 +458,7 @@ function resolveAdapter(modelValue, customStr) {
  */
 async function attemptFetch(adapter, modelName, messages, overrideKey = null) {
   // ── Retrieve the API key ───────────────────────────────────────────────
-  let apiKey = overrideKey;
+  let apiKey = (overrideKey && overrideKey !== 'ENTER_KEY_HERE') ? overrideKey : null;
   if (!apiKey) {
     const stored = await chrome.storage.session.get(adapter.storageKey);
     apiKey = stored[adapter.storageKey];
