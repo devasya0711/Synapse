@@ -132,17 +132,23 @@ chrome.runtime.onConnect.addListener((port) => {
   port.onMessage.addListener(async (msg) => {
     // ── Reconnect signal from a reopened popup ─────────────────────────────
     if (msg.type === 'RECONNECT') {
-      port.postMessage({
-        type: 'STREAM_STATE',
-        isStreaming: isStreamActive,
-      });
+      try {
+        port.postMessage({
+          type: 'STREAM_STATE',
+          isStreaming: isStreamActive,
+        });
+      } catch (err) {
+        console.warn('[Synapse] Failed to send STREAM_STATE on port:', err);
+      }
       return;
     }
 
     // ── Abort signal ───────────────────────────────────────────────────────
     if (msg.type === 'ABORT_STREAM') {
       if (activeAbortController) {
-        activeAbortController.abort();
+        try {
+          activeAbortController.abort();
+        } catch {}
         activeAbortController = null;
       }
       isStreamActive = false;
@@ -153,7 +159,11 @@ chrome.runtime.onConnect.addListener((port) => {
     if (msg.type !== 'RELAY_CONTEXT') return;
 
     if (isStreamActive) {
-      port.postMessage({ type: 'status', message: 'Stream already in progress.' });
+      try {
+        port.postMessage({ type: 'status', message: 'Stream already in progress.' });
+      } catch (err) {
+        console.warn('[Synapse] Failed to send status on port:', err);
+      }
       return;
     }
 
@@ -163,14 +173,18 @@ chrome.runtime.onConnect.addListener((port) => {
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (!tab || isRestrictedUrl(tab.url)) {
       console.warn(`[Synapse] Suppressed DOM extraction on restricted tab: ${tab?.url}`);
-      port.postMessage({
-        type: 'RESTRICTED_TAB',
-        message: 'Active page is a restricted browser tab. Open a standard webpage to extract context.',
-      });
-      port.postMessage({
-        type: 'ERROR',
-        message: 'Active page is a restricted browser tab. Open a standard webpage to extract context.',
-      });
+      try {
+        port.postMessage({
+          type: 'RESTRICTED_TAB',
+          message: 'Active page is a restricted browser tab. Open a standard webpage to extract context.',
+        });
+        port.postMessage({
+          type: 'ERROR',
+          message: 'Active page is a restricted browser tab. Open a standard webpage to extract context.',
+        });
+      } catch (err) {
+        console.warn('[Synapse] Failed to send restricted tab messages on port:', err);
+      }
       await updateSessionStreamStatus(
         false,
         'Active page is a restricted browser tab. Open a standard webpage to extract context.',
@@ -182,7 +196,7 @@ chrome.runtime.onConnect.addListener((port) => {
     isStreamActive = true;
 
     // ── MV3 Keep-alive: ping every 20 s while streaming ───────────────────
-    const keepAliveInterval = setInterval(() => {
+    let keepAliveInterval = setInterval(() => {
       broadcastToPopup({ type: 'ping' });
     }, 20_000);
 
@@ -230,11 +244,18 @@ chrome.runtime.onConnect.addListener((port) => {
       dispatcher.postMessage({ type: 'DONE' });
       await updateSessionStreamStatus(false, '✓ Stream complete', 'success');
     } catch (err) {
+      if (err.name === 'AbortError' || err.message === 'Stream aborted by user.') {
+        console.log('[Synapse] Stream stopped by user.');
+        return;
+      }
       console.error('[Synapse] Relay pipeline failed:', err);
       dispatcher.postMessage({ type: 'ERROR', message: err.message ?? String(err) });
       await updateSessionStreamStatus(false, `✗ ${err.message ?? String(err)}`, 'error');
     } finally {
-      clearInterval(keepAliveInterval);
+      if (keepAliveInterval) {
+        clearInterval(keepAliveInterval);
+        keepAliveInterval = null;
+      }
       isStreamActive = false;
       activeAbortController = null;
     }
@@ -285,7 +306,12 @@ function extractContext(tabId) {
           if (err) reject(new Error(err.message));
         });
 
-        contentPort.postMessage({ type: 'EXTRACT_CONTEXT' });
+        try {
+          contentPort.postMessage({ type: 'EXTRACT_CONTEXT' });
+        } catch (err) {
+          contentPort.disconnect();
+          reject(new Error(`Failed to send message to content script: ${err.message}`));
+        }
       }
     );
     });
@@ -498,20 +524,28 @@ async function relayContext(port, messages, modelValue, customStr) {
 
   console.log(`[Synapse] relayContext — model: ${modelName}, est. tokens: ${tokenCount}`);
 
+  // ── Helper: send safe message through port ────────────────────────────
+  const safePortPost = (p, payload) => {
+    if (!p) return;
+    try {
+      p.postMessage(payload);
+    } catch {
+      /* port may have closed */
+    }
+  };
+
   // ── Helper: send clear + cascade status through port ──────────────────
   const sendCascadeStatus = (message, badge) => {
-    try {
-      port.postMessage({ type: 'clear' });
-      port.postMessage({ type: 'status', message, badge });
-    } catch { /* port may have closed */ }
+    safePortPost(port, { type: 'clear' });
+    safePortPost(port, { type: 'status', message, badge });
   };
 
   // ── Attempt 1: primary ────────────────────────────────────────────────
   try {
     const response = await attemptFetch(adapter, modelName, scrubbedMessages);
     if (response.ok) {
-      port.postMessage({ type: 'badge', badge: modelName });
-      await processSSEStream(response.body, port, adapter);
+      safePortPost(port, { type: 'badge', badge: modelName });
+      await processSSEStream(response.body, port, adapter, activeAbortController?.signal);
       return;
     }
     if (!(response.status === 429 || response.status >= 500)) {
@@ -520,9 +554,15 @@ async function relayContext(port, messages, modelValue, customStr) {
     }
     console.warn(`[Synapse] Primary failed (${response.status}). Cascading to Groq…`);
   } catch (err) {
-    if (err.name === 'AbortError') throw new Error('Stream aborted by user.');
+    if (err.name === 'AbortError' || err.message === 'Stream aborted by user.' || activeAbortController?.signal?.aborted) {
+      throw new Error('Stream aborted by user.');
+    }
     if (err.message?.startsWith('API error') || err.message?.includes('model ID')) throw err;
     console.warn(`[Synapse] Primary network error (${modelName}):`, err);
+  }
+
+  if (!isStreamActive || activeAbortController?.signal?.aborted) {
+    throw new Error('Stream aborted by user.');
   }
 
   // ── Attempt 2: Groq fallback ──────────────────────────────────────────
@@ -535,38 +575,51 @@ async function relayContext(port, messages, modelValue, customStr) {
       groqAdapter, FALLBACK_MODEL, scrubbedMessages, FALLBACK_CONFIG.GROQ_FREE_KEY
     );
     if (groqResponse.ok) {
-      port.postMessage({ type: 'badge', badge: `Groq ${FALLBACK_MODEL} (Fallback)` });
-      await processSSEStream(groqResponse.body, port, groqAdapter);
+      safePortPost(port, { type: 'badge', badge: `Groq ${FALLBACK_MODEL} (Fallback)` });
+      await processSSEStream(groqResponse.body, port, groqAdapter, activeAbortController?.signal);
       groqOk = true;
     } else {
       console.warn(`[Synapse] Groq fallback failed (${groqResponse.status}). Cascading to Gemini…`);
     }
   } catch (err) {
-    if (err.name === 'AbortError') throw new Error('Stream aborted by user.');
+    if (err.name === 'AbortError' || err.message === 'Stream aborted by user.' || activeAbortController?.signal?.aborted) {
+      throw new Error('Stream aborted by user.');
+    }
     console.warn('[Synapse] Groq fallback network error:', err);
   }
 
   if (groqOk) return;
+
+  if (!isStreamActive || activeAbortController?.signal?.aborted) {
+    throw new Error('Stream aborted by user.');
+  }
 
   // ── Attempt 3: Gemini Flash last resort ───────────────────────────────
   sendCascadeStatus('Groq failed. Cascading to Gemini Flash…', 'Gemini Flash (Fallback)');
 
   const geminiAdapter  = ModelAdapters['gemini-2.0-flash'];
   const geminiModel    = 'gemini-2.0-flash';
-  const geminiResponse = await attemptFetch(
-    geminiAdapter, geminiModel, scrubbedMessages, FALLBACK_CONFIG.GEMINI_FREE_KEY
-  );
+  try {
+    const geminiResponse = await attemptFetch(
+      geminiAdapter, geminiModel, scrubbedMessages, FALLBACK_CONFIG.GEMINI_FREE_KEY
+    );
 
-  if (geminiResponse.ok) {
-    port.postMessage({ type: 'badge', badge: 'Gemini 2.0 Flash (Fallback)' });
-    await processSSEStream(geminiResponse.body, port, geminiAdapter);
-    return;
+    if (geminiResponse.ok) {
+      safePortPost(port, { type: 'badge', badge: 'Gemini 2.0 Flash (Fallback)' });
+      await processSSEStream(geminiResponse.body, port, geminiAdapter, activeAbortController?.signal);
+      return;
+    }
+
+    const errBody = await geminiResponse.text().catch(() => '(unreadable)');
+    throw new Error(
+      `All providers failed. Last error — Gemini ${geminiResponse.status}: ${errBody.slice(0, 200)}`
+    );
+  } catch (err) {
+    if (err.name === 'AbortError' || err.message === 'Stream aborted by user.' || activeAbortController?.signal?.aborted) {
+      throw new Error('Stream aborted by user.');
+    }
+    throw err;
   }
-
-  const errBody = await geminiResponse.text().catch(() => '(unreadable)');
-  throw new Error(
-    `All providers failed. Last error — Gemini ${geminiResponse.status}: ${errBody.slice(0, 200)}`
-  );
 }
 
 // ── SSE stream processor ────────────────────────────────────────────────────
@@ -581,16 +634,22 @@ async function relayContext(port, messages, modelValue, customStr) {
  *   • Gemini:        candidates[0].content.parts[0].text
  *
  * @param {ReadableStream<Uint8Array>} body
- * @param {chrome.runtime.Port} port
+ * @param {chrome.runtime.Port|object} port
  * @param {object} adapter
+ * @param {AbortSignal} [signal=null]
  */
-async function processSSEStream(body, port, adapter) {
+async function processSSEStream(body, port, adapter, signal = null) {
   const reader  = body.getReader();
   const decoder = new TextDecoder();
   let buffer    = '';
 
   try {
     while (true) {
+      if (signal?.aborted) {
+        try { await reader.cancel(); } catch {}
+        break;
+      }
+
       const { done, value } = await reader.read();
       if (done) break;
 
@@ -616,7 +675,11 @@ async function processSSEStream(body, port, adapter) {
             const parsed = JSON.parse(jsonStr);
             const text   = extractTextFromChunk(parsed, adapter);
             if (text) {
-              port.postMessage({ type: 'CHUNK', text });
+              try {
+                port.postMessage({ type: 'CHUNK', text });
+              } catch {
+                /* port may have closed */
+              }
             }
           } catch {
             // Non-JSON data line — skip silently (e.g. SSE comments)
@@ -625,7 +688,9 @@ async function processSSEStream(body, port, adapter) {
       }
     }
   } finally {
-    reader.releaseLock();
+    try {
+      reader.releaseLock();
+    } catch {}
   }
 }
 

@@ -121,7 +121,7 @@ export function isRestrictedUrl(url) {
  */
 async function checkActiveTabSafety() {
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    const [tab] = (await chrome.tabs.query({ active: true, currentWindow: true })) || [];
     const isRestricted = isRestrictedUrl(tab?.url);
     isCurrentTabRestricted = isRestricted;
 
@@ -141,6 +141,14 @@ async function checkActiveTabSafety() {
     return !isRestricted;
   } catch (err) {
     console.warn('[Synapse] Active tab check failed:', err);
+    isCurrentTabRestricted = true;
+    if (restrictedTabBanner) {
+      restrictedTabBanner.hidden = false;
+    }
+    if (relayBtn) {
+      relayBtn.disabled = true;
+      relayBtn.title = 'Active page is a restricted browser tab. Open a standard webpage to extract context.';
+    }
     return false;
   }
 }
@@ -205,8 +213,13 @@ function startLockoutCountdown(lockoutUntil) {
       lockStatus.textContent = '';
       lockStatus.className = 'lock-status';
       chrome.storage.local.remove(STORAGE_KEYS.LOCKOUT_UNTIL);
+      chrome.storage.local.set({ [STORAGE_KEYS.FAILED_PIN_ATTEMPTS]: 0 });
       pinInputs.forEach((input) => { input.value = ''; });
-      setTimeout(() => pinInputs[0]?.focus(), 50);
+      setTimeout(() => {
+        if (!pinInputs[0]?.disabled) {
+          pinInputs[0]?.focus();
+        }
+      }, 50);
     }
   };
 
@@ -231,6 +244,7 @@ async function checkPinLockout() {
     return true;
   } else if (lockoutUntil && lockoutUntil <= now) {
     await chrome.storage.local.remove(STORAGE_KEYS.LOCKOUT_UNTIL);
+    await chrome.storage.local.set({ [STORAGE_KEYS.FAILED_PIN_ATTEMPTS]: 0 });
     setPinInputsDisabled(false);
     return false;
   }
@@ -320,7 +334,8 @@ settingsToggleBtn.addEventListener('click', () => {
  * @returns {string}
  */
 function bufferToBase64(buffer) {
-  const bytes = new Uint8Array(buffer);
+  if (!buffer) return '';
+  const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
   let binary = '';
   for (let i = 0; i < bytes.byteLength; i++) {
     binary += String.fromCharCode(bytes[i]);
@@ -334,6 +349,7 @@ function bufferToBase64(buffer) {
  * @returns {Uint8Array}
  */
 function base64ToBuffer(base64) {
+  if (!base64 || typeof base64 !== 'string') return new Uint8Array(0);
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) {
@@ -877,7 +893,12 @@ async function handleRelay() {
     setupPortListeners(relayPort);
 
     // Send the relay trigger through the port
-    relayPort.postMessage({ type: 'RELAY_CONTEXT', model, customModel: customModel || undefined, tabId: tab.id });
+    try {
+      relayPort.postMessage({ type: 'RELAY_CONTEXT', model, customModel: customModel || undefined, tabId: tab.id });
+    } catch (postErr) {
+      console.warn('[Synapse] Failed to send RELAY_CONTEXT on port:', postErr);
+      throw postErr;
+    }
     showStatus(relayStatus, 'Streaming…', '');
     updatePopupState({ statusMessage: 'Streaming…', statusType: '' });
 
@@ -915,7 +936,7 @@ stopBtn.addEventListener('click', () => {
 // Block duplicate keyboard shortcut triggers (Enter) while generation is active
 window.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') {
-    const isGenerating = isRelaying || currentPopupState.isStreaming || Boolean(relayPort);
+    const isGenerating = isRelaying || currentPopupState.isStreaming || Boolean(relayPort) || relayBtn.disabled;
     if (isGenerating) {
       e.preventDefault();
       e.stopPropagation();
@@ -933,8 +954,10 @@ function showLockScreen(setupMode = false) {
   document.body.classList.add('is-locked');
   lockScreen.hidden = false;
   pinInputs.forEach((input) => { input.value = ''; });
-  lockStatus.textContent = '';
-  lockStatus.className = 'lock-status';
+  if (!lockoutTimerId) {
+    lockStatus.textContent = '';
+    lockStatus.className = 'lock-status';
+  }
 
   if (setupMode) {
     lockTitle.textContent = 'Set Master PIN';
@@ -954,7 +977,11 @@ function showLockScreen(setupMode = false) {
     checkPinLockout();
   }
 
-  setTimeout(() => pinInputs[0]?.focus(), 50);
+  setTimeout(() => {
+    if (!pinInputs[0]?.disabled) {
+      pinInputs[0]?.focus();
+    }
+  }, 50);
 }
 
 /**
@@ -1294,7 +1321,11 @@ async function init() {
     try {
       relayPort = chrome.runtime.connect({ name: 'relay-port' });
       setupPortListeners(relayPort);
-      relayPort.postMessage({ type: 'RECONNECT' });
+      try {
+        relayPort.postMessage({ type: 'RECONNECT' });
+      } catch (postErr) {
+        console.warn('[Synapse] Failed to send RECONNECT on port:', postErr);
+      }
     } catch (err) {
       console.warn('[Synapse] Failed to re-attach to stream port:', err);
       relayBtn.disabled = isCurrentTabRestricted;

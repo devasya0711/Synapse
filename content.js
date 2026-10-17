@@ -122,13 +122,21 @@ chrome.runtime.onConnect.addListener((port) => {
 
     try {
       const messages = extractChatGPTHistory();
-      port.postMessage({ type: 'CONTEXT_RESULT', messages });
+      try {
+        port.postMessage({ type: 'CONTEXT_RESULT', messages });
+      } catch (postErr) {
+        console.warn('[Synapse] Failed to send CONTEXT_RESULT on port:', postErr);
+      }
     } catch (err) {
       console.error('[Synapse] Extraction failed:', err);
-      port.postMessage({
-        type:  'CONTEXT_ERROR',
-        error: err.message ?? String(err),
-      });
+      try {
+        port.postMessage({
+          type:  'CONTEXT_ERROR',
+          error: err.message ?? String(err),
+        });
+      } catch (postErr) {
+        console.warn('[Synapse] Failed to send CONTEXT_ERROR on port:', postErr);
+      }
     }
   });
 
